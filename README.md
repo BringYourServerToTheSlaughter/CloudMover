@@ -408,7 +408,7 @@ allocation. Otherwise CloudMover uses an indeterminate activity indicator.
 
 No source-cloud deletion is introduced.
 
-## v0.18.5 — migration controls + selection tree
+## v0.19.3 — migration controls + selection tree
 
 The GUI is now the primary migration control surface.
 
@@ -424,7 +424,7 @@ The GUI is now the primary migration control surface.
 
 This release intentionally does not support changing selection while the engine is running.
 
-## v0.18.5 — picker usability polish
+## v0.19.3 — picker usability polish
 
 - Opens at 1200×850 with a larger minimum size.
 - Gives the file/folder picker substantially more vertical space by default.
@@ -433,7 +433,7 @@ This release intentionally does not support changing selection while the engine 
 - Adds Expand All and Collapse All controls.
 - Migration engine behavior is unchanged.
 
-## v0.18.5 — reliable pause controls + taller picker
+## v0.19.3 — reliable pause controls + taller picker
 
 - Long-running Proton uploads now run in a separate process group.
 - Ctrl+C and GUI Pause can interrupt the active Proton child instead of waiting
@@ -444,7 +444,7 @@ This release intentionally does not support changing selection while the engine 
 - Default window: 1260×930.
 - Picker gets ~650 px initial vertical space and remains draggable.
 
-## v0.18.5 — first-run experience
+## v0.19.3 — first-run experience
 
 CloudMover now has an initial onboarding path for the locked v1 scope:
 iCloud Drive → Proton Drive on macOS.
@@ -461,20 +461,20 @@ On a new database the GUI now:
 
 Existing migration databases skip onboarding and open directly in the proven migration monitor.
 
-## v0.18.5 — migration process isolation
+## v0.19.3 — migration process isolation
 
 Engine PID files are now scoped to each migration database. A fresh onboarding/test
 database can no longer mistake a real migration engine in the same `.cloudmover`
 directory for its own process.
 
-## v0.18.5 — selection safety hotfix
+## v0.19.3 — selection safety hotfix
 - Fixed critical byte-target scheduler omission: PENDING candidates now require selected=1.
 - Release backlog also respects selected=1.
 - Added executable regression tests proving deselected rows cannot enter the batch.
 - Pause escalates to SIGTERM after four seconds if graceful SIGINT does not stop the engine.
 - New migrations say Start Migration; previously-started migrations say Resume Migration.
 
-## v0.18.5 — destination + complete-selection safety
+## v0.19.3 — destination + complete-selection safety
 
 - The production engine now reads the Proton destination from the migration plan.
 - There is no default `CloudMover-013-Test` destination in normal engine startup.
@@ -485,7 +485,7 @@ directory for its own process.
 - Zero-byte and sub-1 MB selected files are no longer silently stranded.
 - The GUI displays the stored Proton destination beside the route.
 
-## v0.18.5 — completion workflow
+## v0.19.3 — completion workflow
 
 - COMPLETE is no longer a dead end.
 - The primary action becomes **New Migration**.
@@ -496,7 +496,7 @@ directory for its own process.
 - Stale Starting/Resuming/Pausing notices are cleared on completion.
 - Completed file selection is presented as migration history rather than editable work.
 
-## v0.18.5 — single-window lifecycle + reordered workspace
+## v0.19.3 — single-window lifecycle + reordered workspace
 
 - New Migration no longer opens a second/modal window.
 - Setup/onboarding now lives in the same main window using a stacked page layout.
@@ -507,9 +507,77 @@ directory for its own process.
   3. Controls
 - New/paused wording now says: “Choose what to move, then start the migration.”
 
-### v0.18.5 process lifecycle safety
+### v0.19.3 process lifecycle safety
 
 - Closing the CloudMover window pauses/stops the engine tied to that migration DB.
 - Ctrl+C in the Terminal running the GUI also stops the detached migration engine.
 - Shutdown tries SIGINT first, then SIGTERM, and only uses SIGKILL as a last resort.
 - This prevents an invisible background migration from continuing after the GUI exits.
+
+
+## v0.19.3 — macOS packaging foundation
+
+CloudMover now has a first-class macOS application build path.
+
+Runtime data defaults to:
+
+`~/Library/Application Support/CloudMover/`
+
+including the migration database and JSONL log. Development commands can still
+override `--db` and `--log`.
+
+To build the unsigned local app on macOS:
+
+```bash
+cd ~/GitHub/cloudmover
+./scripts/build_macos_app.sh
+```
+
+or:
+
+```bash
+make app
+```
+
+The result is:
+
+`dist/CloudMover.app`
+
+Launch it with Finder or:
+
+```bash
+open dist/CloudMover.app
+```
+
+This build is intentionally unsigned and unnotarized. Code signing,
+notarization, DMG packaging, and Proton CLI provisioning are later packaging
+milestones.
+
+## v0.19.3 — live iCloud inventory correctness
+
+- The picker now overlays migration rows onto the current live iCloud directory tree.
+- Empty folders and folders with no currently tracked regular files are visible.
+- While paused/planned, CloudMover reconciles newly added, changed, and removed files
+  without intentionally hydrating cloud-only contents.
+- New files discovered after selection are added **unselected** for safety.
+- Completed rows are preserved as immutable migration history.
+- Inventory is reconciled again immediately before Start/Resume.
+- `0 / 0 selected files` now renders as 0%, never 100%.
+
+## v0.19.3 — packaged migration worker
+
+- Fixed Start Migration inside `CloudMover.app`.
+- Development mode still launches the engine with
+  `python -m src.cloudmover.start`.
+- Packaged mode now relaunches the bundled CloudMover executable with a private
+  `--engine-worker` switch.
+- The packaged migration engine therefore does not require an external Python
+  interpreter and no longer receives the invalid `-m src.cloudmover.start` arguments.
+
+## v0.19.3 — CloudMover app icon
+
+- Added the official orange/grey CloudMover application icon.
+- Added a 1024px PNG source asset.
+- Added a macOS `.icns` bundle icon.
+- PyInstaller now embeds the icon into `CloudMover.app`.
+- Finder and the Dock will use the branded CloudMover icon after rebuilding.

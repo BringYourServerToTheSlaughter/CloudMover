@@ -77,7 +77,7 @@ def main():
     ap.add_argument("--reserve-gb",type=float,default=20.0)
     ap.add_argument("--verify-workers",type=int,default=1)
     a=ap.parse_args()
-    print("CloudMover 0.18.5")
+    print("CloudMover 0.19.3")
     print("Rolling SMART_STAGING engine")
     print("Safety: verified Proton copy required before local iCloud cache release")
     try:

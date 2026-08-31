@@ -227,6 +227,122 @@ def initialize_migration(source: Path, db_path: Path, destination: str | None = 
     return get_summary(db_path, migration_id)
 
 
+
+def reconcile_migration_inventory(db_path: Path, migration_id: str | None = None) -> dict[str, int]:
+    """Reconcile a paused/planned migration manifest with the current iCloud source.
+
+    This is metadata-only: stat/placeholder inspection is used, file contents are not
+    opened or intentionally hydrated. Completed rows are preserved as history.
+    Newly discovered files are added unselected so CloudMover never surprises the user
+    by transferring something that appeared after they made a selection.
+    """
+    conn = connect(db_path)
+    try:
+        create_schema(conn)
+        migration_id = migration_id or get_latest_migration_id(conn)
+        migration = conn.execute(
+            "SELECT source,status FROM migrations WHERE id=?", (migration_id,)
+        ).fetchone()
+        if migration is None:
+            raise LookupError(f"migration not found: {migration_id}")
+        status = str(migration["status"]).upper()
+        if status == "RUNNING":
+            raise RuntimeError("cannot reconcile inventory while migration is running")
+        if status == "COMPLETE":
+            return {"added": 0, "updated": 0, "removed": 0}
+
+        source = Path(str(migration["source"])).expanduser()
+        if not source.exists() or not source.is_dir():
+            raise FileNotFoundError(f"source does not exist: {source}")
+
+        existing = {
+            str(row["relative_path"]): row
+            for row in conn.execute(
+                """SELECT relative_path,transfer_state,logical_bytes,allocated_bytes,
+                          hydration_state
+                   FROM files WHERE migration_id=?""", (migration_id,)
+            ).fetchall()
+        }
+
+        seen: set[str] = set()
+        added = updated = removed = 0
+        now = utc_now()
+
+        for entry in walk_entries(source):
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                observed = inspect_file(entry.path, stat_result=st)
+                path = Path(entry.path)
+                relative = str(path.relative_to(source))
+                seen.add(relative)
+                row = existing.get(relative)
+
+                if row is None:
+                    conn.execute(
+                        """INSERT INTO files(
+                               migration_id,relative_path,source_path,logical_bytes,
+                               allocated_bytes,hydration_state,transfer_state,selected,
+                               created_at,updated_at
+                           ) VALUES (?,?,?,?,?,?,'PENDING',0,?,?)""",
+                        (
+                            migration_id, relative, str(path), observed.logical_bytes,
+                            observed.allocated_bytes, observed.hydration.value, now, now,
+                        ),
+                    )
+                    added += 1
+                    continue
+
+                # Never rewrite immutable completed history. For unfinished rows, keep
+                # metadata aligned with the filesystem before the user starts/resumes.
+                if str(row["transfer_state"]) != TransferState.COMPLETE.value:
+                    if (
+                        int(row["logical_bytes"]) != int(observed.logical_bytes)
+                        or int(row["allocated_bytes"]) != int(observed.allocated_bytes)
+                        or str(row["hydration_state"]) != observed.hydration.value
+                    ):
+                        conn.execute(
+                            """UPDATE files
+                               SET source_path=?,logical_bytes=?,allocated_bytes=?,
+                                   hydration_state=?,updated_at=?
+                               WHERE migration_id=? AND relative_path=?""",
+                            (
+                                str(path), observed.logical_bytes, observed.allocated_bytes,
+                                observed.hydration.value, now, migration_id, relative,
+                            ),
+                        )
+                        updated += 1
+            except (PermissionError, FileNotFoundError, OSError):
+                continue
+
+        # Remove only unfinished rows that truly disappeared. COMPLETE remains audit history.
+        for relative, row in existing.items():
+            if relative in seen:
+                continue
+            if str(row["transfer_state"]) != TransferState.COMPLETE.value:
+                conn.execute(
+                    "DELETE FROM files WHERE migration_id=? AND relative_path=?",
+                    (migration_id, relative),
+                )
+                removed += 1
+
+        totals = conn.execute(
+            """SELECT COUNT(*) n,COALESCE(SUM(logical_bytes),0) b
+               FROM files WHERE migration_id=?""", (migration_id,)
+        ).fetchone()
+        conn.execute(
+            """UPDATE migrations
+               SET total_files=?,total_logical_bytes=?,updated_at=?
+               WHERE id=?""",
+            (int(totals["n"]), int(totals["b"]), now, migration_id),
+        )
+        conn.commit()
+        return {"added": added, "updated": updated, "removed": removed}
+    finally:
+        conn.close()
+
+
 def get_latest_migration_id(conn: sqlite3.Connection) -> str:
     row = conn.execute("SELECT id FROM migrations ORDER BY created_at DESC LIMIT 1").fetchone()
     if row is None:
@@ -303,7 +419,7 @@ def transition_file(
 
 
 def print_summary(summary: MigrationSummary, db_path: Path) -> None:
-    print("CloudMover 0.18.5")
+    print("CloudMover 0.19.3")
     print()
     print(f"Migration:  {summary.migration_id}")
     print(f"Database:   {db_path.expanduser()}")

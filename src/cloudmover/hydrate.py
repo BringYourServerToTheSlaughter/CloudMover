@@ -385,7 +385,7 @@ def main() -> None:
     parser.add_argument("--min-bytes", type=int, default=None)
     args = parser.parse_args()
 
-    print("CloudMover 0.18.5")
+    print("CloudMover 0.19.3")
     print()
 
     if args.batch:

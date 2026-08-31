@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 .cloudmover/
 *.db
+build/
+dist/
+*.spec.bak

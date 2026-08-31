@@ -357,7 +357,7 @@ def main():
     ap.add_argument("--hydrate-workers",type=int,default=1)
     ap.add_argument("--verbose",action="store_true")
     a=ap.parse_args()
-    print("CloudMover 0.18.5\n")
+    print("CloudMover 0.19.3\n")
     print("Bulk end-to-end performance trial")
     print(f"Destination: {a.destination}")
     print("Strategy:    hydrate batch -> hard-link tree -> ONE Proton upload -> exact verify\n")

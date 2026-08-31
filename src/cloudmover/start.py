@@ -9,8 +9,9 @@ from .engine import migration_id, free_bytes
 from .release import release_specific, human_bytes
 from .state import connect, create_schema, get_latest_migration_id, utc_now
 from .ui import dashboard
+from .app_paths import default_db_path, default_log_path, ensure_app_support
 
-VERSION="0.18.5"
+VERSION="0.19.3"
 
 def engine_pid_path(db:Path)->Path:
     return db.with_name(db.stem + ".engine.pid")
@@ -266,7 +267,7 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
 
 def main():
     ap=argparse.ArgumentParser(description="CloudMover production-engine trial")
-    ap.add_argument("--db",type=Path,default=Path(".cloudmover/migration.db"))
+    ap.add_argument("--db",type=Path,default=None)
     ap.add_argument("--batch",type=int,default=250)
     ap.add_argument("--reserve-gb",type=float,default=20.0)
     ap.add_argument("--destination",default=None, help="optional safety assertion; must match destination stored in migration plan")
@@ -277,9 +278,12 @@ def main():
                     help="show detailed per-file migration output")
     ap.add_argument("--min-bytes",type=int,default=1_000_000)
     ap.add_argument("--max-bytes",type=int,default=100_000_000)
-    ap.add_argument("--log",type=Path,default=Path(".cloudmover/cloudmover.jsonl"))
+    ap.add_argument("--log",type=Path,default=None)
     ap.add_argument("--dry-run",action="store_true")
     a=ap.parse_args()
+    ensure_app_support()
+    a.db = a.db.expanduser() if a.db else default_db_path()
+    a.log = a.log.expanduser() if a.log else default_log_path()
     reserve=int(a.reserve_gb*1_000_000_000)
     print(f"CloudMover {VERSION}")
     print("Continuous SMART_STAGING engine")

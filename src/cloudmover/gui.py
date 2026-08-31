@@ -2,11 +2,12 @@ from __future__ import annotations
 import argparse, os, signal, subprocess, sys, shutil, time
 from pathlib import Path
 
-from .scanner import human_bytes
-from .state import connect, create_schema, initialize_migration
+from .scanner import human_bytes, walk_entries
+from .state import connect, create_schema, initialize_migration, reconcile_migration_inventory
 from .providers.icloud import inspect_file, HydrationState
+from .app_paths import default_db_path, ensure_app_support
 
-VERSION="0.18.5"
+VERSION="0.19.3"
 
 def snapshot(db_path: Path) -> dict:
     conn=connect(db_path)
@@ -66,7 +67,7 @@ def selection_rows(db_path: Path):
     conn=connect(db_path)
     try:
         create_schema(conn)
-        m=conn.execute("SELECT id,status FROM migrations ORDER BY created_at DESC LIMIT 1").fetchone()
+        m=conn.execute("SELECT id,status,source FROM migrations ORDER BY created_at DESC LIMIT 1").fetchone()
         if not m:
             return None,[]
         rows=conn.execute(
@@ -81,7 +82,7 @@ def set_selection_prefix(db_path: Path, prefix: str, selected: bool) -> int:
     conn=connect(db_path)
     try:
         create_schema(conn)
-        m=conn.execute("SELECT id,status FROM migrations ORDER BY created_at DESC LIMIT 1").fetchone()
+        m=conn.execute("SELECT id,status,source FROM migrations ORDER BY created_at DESC LIMIT 1").fetchone()
         if not m:
             raise RuntimeError("No migration found.")
         if str(m["status"]).upper()=="RUNNING":
@@ -116,8 +117,29 @@ def migration_has_started(db_path: Path) -> bool:
     finally:
         conn.close()
 
-def build_tree_index(rows):
+
+def source_directories(source: Path) -> list[str]:
+    """Return the live iCloud directory hierarchy, including empty folders."""
+    source=Path(source).expanduser()
+    result=[]
+    if not source.exists():
+        return result
+    for entry in walk_entries(source):
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                result.append(str(Path(entry.path).relative_to(source)))
+        except (PermissionError,FileNotFoundError,OSError,ValueError):
+            continue
+    return result
+
+def build_tree_index(rows, directories=None):
     root={"dirs":{},"files":[],"selected":0,"total":0,"bytes":0,"selected_bytes":0}
+    for relative in directories or []:
+        node=root
+        for part in Path(str(relative)).parts:
+            node=node["dirs"].setdefault(
+                part,{"dirs":{},"files":[],"selected":0,"total":0,"bytes":0,"selected_bytes":0}
+            )
     for r in rows:
         parts=Path(str(r["relative_path"])).parts
         node=root
@@ -567,6 +589,11 @@ def main():
         def resume_migration(self):
             if self.live_engine_pid():
                 self.notice.setText("CloudMover is already running."); return
+            try:
+                reconcile_migration_inventory(self.db_path)
+            except Exception as exc:
+                self.notice.setText(f"Could not refresh iCloud Drive before start: {exc}")
+                return
             first_start=not migration_has_started(self.db_path)
             if first_start:
                 self.notice.setText("Starting migration…")
@@ -575,10 +602,22 @@ def main():
                 self.notice.setText("Resuming… recovery checks are running.")
                 self.resume_btn.setText("Resuming…")
             self.resume_btn.setEnabled(False); self.pause_btn.setEnabled(False)
-            cmd=[sys.executable,"-m","src.cloudmover.start","--db",str(self.db_path),
-                 "--target-mb","250","--batch","250","--reserve-gb","20"]
+            common=[
+                "--db",str(self.db_path),
+                "--target-mb","250",
+                "--batch","250",
+                "--reserve-gb","20",
+            ]
+            if getattr(sys,"frozen",False):
+                # In CloudMover.app sys.executable is the bundled CloudMover binary,
+                # not Python. Re-enter the bundle through its private worker mode.
+                cmd=[sys.executable,"--engine-worker",*common]
+                cwd=None
+            else:
+                cmd=[sys.executable,"-m","src.cloudmover.start",*common]
+                cwd=str(Path(__file__).resolve().parents[2])
             try:
-                subprocess.Popen(cmd,cwd=str(Path(__file__).resolve().parents[2]),start_new_session=True)
+                subprocess.Popen(cmd,cwd=cwd,start_new_session=True)
             except OSError as exc:
                 self.notice.setText(f"Could not resume migration: {exc}")
 
@@ -588,7 +627,22 @@ def main():
             self.tree.clear()
             if not m:
                 self._selection_loading=False; return
-            index=build_tree_index(rows)
+
+            status=str(m["status"]).upper()
+            if status not in ("RUNNING","COMPLETE"):
+                try:
+                    changes=reconcile_migration_inventory(self.db_path)
+                    if any(changes.values()):
+                        self.notice.setText(
+                            f"Source refreshed • {changes['added']} added • "
+                            f"{changes['updated']} updated • {changes['removed']} removed."
+                        )
+                    m,rows=selection_rows(self.db_path)
+                except Exception as exc:
+                    self.notice.setText(f"Could not refresh iCloud inventory: {exc}")
+
+            directories=source_directories(Path(str(m["source"])))
+            index=build_tree_index(rows,directories)
 
             root_item=QTreeWidgetItem(["iCloud Drive",human_bytes(index["bytes"]),""])
             root_item.setData(0,Qt.UserRole,"")
@@ -599,7 +653,8 @@ def main():
             def add_node(parent,node,prefix):
                 for name,child in sorted(node["dirs"].items(),key=lambda x:x[0].lower()):
                     path=f"{prefix}/{name}".strip("/")
-                    item=QTreeWidgetItem([name,human_bytes(child["bytes"]),"Folder"])
+                    folder_status="Folder" if child["total"] else "Empty Folder"
+                    item=QTreeWidgetItem([name,human_bytes(child["bytes"]),folder_status])
                     item.setData(0,Qt.UserRole,path)
                     item.setFlags(item.flags()|Qt.ItemIsUserCheckable)
                     self.apply_check(item,child["selected"],child["total"])
@@ -670,7 +725,7 @@ def main():
                 destination=str(m["destination"] or "")
                 self.route.setText(f"iCloud Drive   →   Proton Drive   ({destination or 'destination not set'})")
                 total=s["selected_bytes"]; done=int(d["b"])
-                pct=(done/total*100 if total else 100.0)
+                pct=(done/total*100 if total else 0.0)
                 self.bar.setValue(round(max(0,min(100,pct))*100))
                 self.status.setText(f"Migrating   {pct:.2f}%")
                 self.overall.setText(
@@ -756,10 +811,11 @@ def main():
                 self.stage.setText("Unable to read migration"); self.current.setText(str(exc))
 
     ap=argparse.ArgumentParser(description="CloudMover migration application")
-    ap.add_argument("--db",default=".cloudmover/migration.db")
+    ap.add_argument("--db",default=None)
     args=ap.parse_args()
     app=QApplication([])
-    db_path=Path(args.db)
+    ensure_app_support()
+    db_path=Path(args.db).expanduser() if args.db else default_db_path()
     w=Window(db_path)
     if not has_migration(db_path):
         w.root_stack.setCurrentWidget(w.setup_page)

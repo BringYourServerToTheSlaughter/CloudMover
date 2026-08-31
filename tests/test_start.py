@@ -2,7 +2,7 @@
 from src.cloudmover.start import choose_batch, fmt_duration, VERSION
 
 def test_version():
-    assert VERSION == "0.18.5"
+    assert VERSION == "0.19.3"
 
 def test_batch_reduces_near_reserve():
     reserve=20_000_000_000

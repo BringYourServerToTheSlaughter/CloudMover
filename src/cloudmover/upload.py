@@ -124,7 +124,7 @@ def main():
     ap.add_argument("--db",type=Path,default=Path(".cloudmover/migration.db"))
     ap.add_argument("--destination",default="/my-files/CloudMover-Test")
     a=ap.parse_args()
-    print("CloudMover 0.18.5\n\nSingle-file Proton upload trial")
+    print("CloudMover 0.19.3\n\nSingle-file Proton upload trial")
     item=pick(a.db)
     print(f"File:        {item.relative_path}")
     print(f"Destination: {a.destination}")
