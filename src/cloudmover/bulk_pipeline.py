@@ -8,8 +8,8 @@ from .ui import Activity
 
 from .hydrate import hydrate_one, select_batch, recover_incomplete, human_bytes
 from .providers import proton
-from .state import TransferState, transition_file, connect, create_schema, get_latest_migration_id
-from .upload import set_destination
+from .state import TransferState, transition_file, connect, create_schema, get_latest_migration_id, set_activity_progress
+from .upload import ensure_remote_tree, set_destination
 
 DEFAULT_COUNT=10
 DEFAULT_MIN=100_000
@@ -240,6 +240,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
     print()
 
     timings={"hydrate":0.0,"stage":0.0,"upload":0.0,"verify":0.0}
+    set_activity_progress(db,stage="hydrate",completed=0,total=len(items),detail="Preparing selected files")
     if hydrate_workers > 1:
         print(f"Hydration:   up to {hydrate_workers} concurrent file(s)")
         hydrated,t_hydrate=hydrate_selected_parallel(
@@ -247,6 +248,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
             workers=hydrate_workers
         )
         timings["hydrate"]=t_hydrate
+        set_activity_progress(db,stage="hydrate",completed=len(hydrated),total=len(items),detail="Hydration complete")
     else:
         hydrated=[]
         for i,item in enumerate(items,1):
@@ -260,6 +262,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
                         timeout_seconds=timeout,max_bytes=max_bytes,min_bytes=min_bytes)
             timings["hydrate"] += perf_counter()-t
             hydrated.append(item)
+            set_activity_progress(db,stage="hydrate",completed=len(hydrated),total=len(items),detail=item.relative_path)
 
     with tempfile.TemporaryDirectory(prefix="cloudmover-stage-") as td:
         stage=Path(td)
@@ -270,6 +273,10 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
         # Ensure only the destination root once; folder hierarchy is sent in bulk.
         parent,name=destination.rsplit("/",1)
         base=proton.ensure_folder(parent or "/",name)
+        remote_cache={base}
+        for item in hydrated:
+            _,remote_file=ensure_remote_tree(base,item.relative_path,remote_cache)
+            proton.assert_no_remote_file(remote_file)
 
         for item in hydrated:
             transition_file(db,item.migration_id,item.relative_path,
@@ -278,9 +285,16 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
         try:
             t=perf_counter()
             payload_detail=f"{payload_bytes/1024**2:,.1f} MB" if payload_bytes else ""
+            set_activity_progress(db,stage="upload",completed=0,total=0,detail=f"{len(hydrated):,} files • {human_bytes(payload_bytes)}")
             with Activity("Uploading",payload_detail,enabled=not verbose):
-                proton.upload_many(top_paths,base)
+                for item in hydrated:
+                    parts=Path(item.relative_path).parts
+                    remote_parent=base.rstrip("/")
+                    if len(parts)>1:
+                        remote_parent += "/" + "/".join(parts[:-1])
+                    proton.safe_upload_promote(stage/item.relative_path,remote_parent,parts[-1])
             timings["upload"]=perf_counter()-t
+            set_activity_progress(db,stage="upload",completed=1,total=1,detail="Upload complete")
         except Exception as exc:
             for item in hydrated:
                 try:
@@ -304,15 +318,17 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
 
         verified_count=0
         tree_ok=True
+        set_activity_progress(db,stage="verify",completed=0,total=max(1,len(top_groups)),detail="Checking Proton destination")
         try:
-            for top,group in top_groups.items():
+            for group_index,(top,group) in enumerate(top_groups.items(),1):
                 subtree=base.rstrip("/")+"/"+top
                 rels=[]
                 for item in group:
                     parts=Path(item.relative_path).parts
                     rels.append("/".join(parts[1:]) if len(parts)>1 else parts[0])
                 proton.verify_tree(stage/top,subtree,rels)
-        except Exception:
+                set_activity_progress(db,stage="verify",completed=group_index,total=len(top_groups),detail=f"Verified {top}")
+        except proton.TreeVerificationUnavailable:
             tree_ok=False
 
         if not tree_ok:
@@ -323,9 +339,11 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
                 if len(parts)>1:
                     remote_parent += "/" + "/".join(parts[:-1])
                 groups.setdefault(remote_parent, []).append(item)
-            for remote_parent,group in groups.items():
+            set_activity_progress(db,stage="verify",completed=0,total=max(1,len(groups)),detail="Checking Proton folders")
+            for group_index,(remote_parent,group) in enumerate(groups.items(),1):
                 locals_=[Path(item.source_path) for item in group]
                 proton.verify_many_in_parent(locals_,remote_parent)
+                set_activity_progress(db,stage="verify",completed=group_index,total=len(groups),detail=remote_parent)
 
         for item in hydrated:
             remote_file=base.rstrip("/")+"/"+item.relative_path
@@ -335,6 +353,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
             verified_count+=1
             print(f"[verify  {verified_count}/{len(items)}] COMPLETE {item.relative_path}")
         timings["verify"]=perf_counter()-t
+        set_activity_progress(db,stage="complete",completed=1,total=1,detail="Batch verified")
 
     total=sum(timings.values())
     print("\nTiming totals")
@@ -357,7 +376,7 @@ def main():
     ap.add_argument("--hydrate-workers",type=int,default=1)
     ap.add_argument("--verbose",action="store_true")
     a=ap.parse_args()
-    print("CloudMover 0.19.3\n")
+    print("CloudMover 0.19.5\n")
     print("Bulk end-to-end performance trial")
     print(f"Destination: {a.destination}")
     print("Strategy:    hydrate batch -> hard-link tree -> ONE Proton upload -> exact verify\n")

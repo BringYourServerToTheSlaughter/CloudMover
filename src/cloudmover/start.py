@@ -7,11 +7,11 @@ from pathlib import Path
 from .bulk_pipeline import run_bulk
 from .engine import migration_id, free_bytes
 from .release import release_specific, human_bytes
-from .state import connect, create_schema, get_latest_migration_id, utc_now
+from .state import connect, create_schema, get_latest_migration_id, utc_now, recover_stale_runtime_state
 from .ui import dashboard
 from .app_paths import default_db_path, default_log_path, ensure_app_support
 
-VERSION="0.19.3"
+VERSION="0.19.5"
 
 def engine_pid_path(db:Path)->Path:
     return db.with_name(db.stem + ".engine.pid")
@@ -189,13 +189,21 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
             f"destination override does not match migration plan: {destination} != {stored_destination}"
         )
     destination=stored_destination
+    # Recovery must happen while the migration is still paused. This makes direct
+    # CLI/packaged-worker resumes safe even if the previous process died mid-stage.
+    recovered_startup=recover_stale_runtime_state(db)
     started=time.monotonic(); cycle=0
     baseline=snapshot(db)
     baseline_files=baseline["complete_files"]
     baseline_bytes=baseline["complete_bytes"]
-    set_migration_status(db,"RUNNING")
+
+    # Claim runtime ownership first, then advertise RUNNING.
     write_engine_pid(db)
-    log_event(log_path,"start",migration_id=migration_id(db))
+    set_migration_status(db,"RUNNING")
+    log_event(
+        log_path,"start",migration_id=migration_id(db),
+        recovered_startup=recovered_startup,
+    )
     try:
         while True:
             s=snapshot(db)
@@ -268,7 +276,7 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
 def main():
     ap=argparse.ArgumentParser(description="CloudMover production-engine trial")
     ap.add_argument("--db",type=Path,default=None)
-    ap.add_argument("--batch",type=int,default=250)
+    ap.add_argument("--batch",type=int,default=5000)
     ap.add_argument("--reserve-gb",type=float,default=20.0)
     ap.add_argument("--destination",default=None, help="optional safety assertion; must match destination stored in migration plan")
     ap.add_argument("--max-cycles",type=int,default=None)
@@ -285,6 +293,11 @@ def main():
     a.db = a.db.expanduser() if a.db else default_db_path()
     a.log = a.log.expanduser() if a.log else default_log_path()
     reserve=int(a.reserve_gb*1_000_000_000)
+
+    def _termination_as_interrupt(signum,frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM,_termination_as_interrupt)
+
     print(f"CloudMover {VERSION}")
     print("Continuous SMART_STAGING engine")
     print("Ctrl+C safely pauses; rerun the same command to resume.\n")

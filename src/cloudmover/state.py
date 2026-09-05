@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
-from .providers.icloud import inspect_file
+from .providers.icloud import HydrationState, inspect_file
 from .scanner import choose_strategy, human_bytes, walk_entries
 
 SCHEMA_VERSION = 4
@@ -143,7 +143,12 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def initialize_migration(source: Path, db_path: Path, destination: str | None = None) -> MigrationSummary:
+def initialize_migration(
+    source: Path,
+    db_path: Path,
+    destination: str | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> MigrationSummary:
     source = source.expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(f"source does not exist: {source}")
@@ -157,14 +162,28 @@ def initialize_migration(source: Path, db_path: Path, destination: str | None = 
     # opening file contents and therefore avoids hydrating iCloud placeholders.
     file_rows: list[tuple[str, str, int, int, str]] = []
     total_bytes = 0
+    files_seen = 0
+    folders_seen = 0
+    cloud_only_seen = 0
     for entry in walk_entries(source):
         try:
+            path = Path(entry.path)
+            relative = str(path.relative_to(source))
+            if entry.is_dir(follow_symlinks=False):
+                folders_seen += 1
+                if progress_callback:
+                    progress_callback({
+                        "relative_path": relative,
+                        "files": files_seen,
+                        "folders": folders_seen,
+                        "logical_bytes": total_bytes,
+                        "cloud_only": cloud_only_seen,
+                    })
+                continue
             if not entry.is_file(follow_symlinks=False):
                 continue
             st = entry.stat(follow_symlinks=False)
             state = inspect_file(entry.path, stat_result=st)
-            path = Path(entry.path)
-            relative = str(path.relative_to(source))
             file_rows.append(
                 (
                     relative,
@@ -175,8 +194,29 @@ def initialize_migration(source: Path, db_path: Path, destination: str | None = 
                 )
             )
             total_bytes += state.logical_bytes
+            files_seen += 1
+            if state.hydration is HydrationState.CLOUD_ONLY:
+                cloud_only_seen += 1
+            if progress_callback:
+                progress_callback({
+                    "relative_path": relative,
+                    "files": files_seen,
+                    "folders": folders_seen,
+                    "logical_bytes": total_bytes,
+                    "cloud_only": cloud_only_seen,
+                })
         except (PermissionError, FileNotFoundError, OSError) as exc:
             print(f"warning: could not inventory {entry.path}: {exc}")
+
+    if progress_callback:
+        progress_callback({
+            "relative_path": "",
+            "files": files_seen,
+            "folders": folders_seen,
+            "logical_bytes": total_bytes,
+            "cloud_only": cloud_only_seen,
+            "final": True,
+        })
 
     strategy, staging_bytes, reserve_bytes = choose_strategy(total_bytes, free_bytes)
     migration_id = str(uuid.uuid4())
@@ -343,6 +383,107 @@ def reconcile_migration_inventory(db_path: Path, migration_id: str | None = None
         conn.close()
 
 
+
+
+def recover_stale_runtime_state(db_path: Path) -> dict[str,int]:
+    """Make a migration retry-safe when no worker owns its transient state.
+
+    This is intentionally idempotent. COMPLETE rows are never changed.
+    """
+    conn=connect(db_path)
+    try:
+        create_schema(conn)
+        row=conn.execute(
+            "SELECT id,status FROM migrations ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return {"HYDRATING":0,"UPLOADING":0,"VERIFYING":0}
+        mid=str(row["id"])
+        counts={}
+        for transfer_state in ("HYDRATING","UPLOADING","VERIFYING"):
+            counts[transfer_state]=int(conn.execute(
+                "SELECT COUNT(*) n FROM files WHERE migration_id=? AND transfer_state=?",
+                (mid,transfer_state),
+            ).fetchone()["n"])
+
+        now=utc_now()
+        conn.execute(
+            """UPDATE files
+               SET transfer_state='PENDING',
+                   last_error='Recovered after interrupted hydration',
+                   updated_at=?
+               WHERE migration_id=? AND transfer_state='HYDRATING'""",
+            (now,mid),
+        )
+        conn.execute(
+            """UPDATE files
+               SET transfer_state='READY',
+                   last_error='Recovered after interrupted upload',
+                   updated_at=?
+               WHERE migration_id=? AND transfer_state='UPLOADING'""",
+            (now,mid),
+        )
+        conn.execute(
+            """UPDATE files
+               SET transfer_state='READY',
+                   last_error='Recovered after interrupted verification',
+                   updated_at=?
+               WHERE migration_id=? AND transfer_state='VERIFYING'""",
+            (now,mid),
+        )
+        # A dead worker cannot truthfully own RUNNING state.
+        if str(row["status"]).upper()=="RUNNING":
+            conn.execute(
+                "UPDATE migrations SET status='PAUSED',updated_at=? WHERE id=?",
+                (now,mid),
+            )
+        conn.commit()
+        return counts
+    finally:
+        conn.close()
+
+
+def set_activity_progress(db_path: Path, *, stage: str, completed: int=0, total: int=0, detail: str="") -> None:
+    import json
+    payload=json.dumps({
+        "stage":str(stage),
+        "completed":max(0,int(completed)),
+        "total":max(0,int(total)),
+        "detail":str(detail),
+    })
+    conn=connect(db_path)
+    try:
+        create_schema(conn)
+        conn.execute(
+            """INSERT INTO metadata(key,value) VALUES('activity_progress',?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (payload,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_activity_progress(db_path: Path) -> dict:
+    import json
+    conn=connect(db_path)
+    try:
+        create_schema(conn)
+        row=conn.execute("SELECT value FROM metadata WHERE key='activity_progress'").fetchone()
+        if not row:
+            return {"stage":"","completed":0,"total":0,"detail":""}
+        try:
+            data=json.loads(str(row["value"]))
+        except Exception:
+            return {"stage":"","completed":0,"total":0,"detail":""}
+        return {
+            "stage":str(data.get("stage","")),
+            "completed":max(0,int(data.get("completed",0))),
+            "total":max(0,int(data.get("total",0))),
+            "detail":str(data.get("detail","")),
+        }
+    finally:
+        conn.close()
+
 def get_latest_migration_id(conn: sqlite3.Connection) -> str:
     row = conn.execute("SELECT id FROM migrations ORDER BY created_at DESC LIMIT 1").fetchone()
     if row is None:
@@ -419,7 +560,7 @@ def transition_file(
 
 
 def print_summary(summary: MigrationSummary, db_path: Path) -> None:
-    print("CloudMover 0.19.3")
+    print("CloudMover 0.19.5")
     print()
     print(f"Migration:  {summary.migration_id}")
     print(f"Database:   {db_path.expanduser()}")

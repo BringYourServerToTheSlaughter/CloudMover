@@ -6,11 +6,11 @@ def test_json_flag_is_command_level(monkeypatch):
         returncode = 0
         stdout = "[]"
         stderr = ""
-    def fake_run(cmd, text, capture_output):
+    def fake_run_cli(cmd, timeout=120.0):
         seen["cmd"] = cmd
-        return R()
+        return "[]","",0
     monkeypatch.setattr(proton.shutil, "which", lambda _: "/usr/local/bin/proton-drive")
-    monkeypatch.setattr(proton.subprocess, "run", fake_run)
+    monkeypatch.setattr(proton, "_run_cli_process", fake_run_cli)
     proton.run(["filesystem", "list", "/my-files"], json_output=True)
     assert seen["cmd"] == [
         "/usr/local/bin/proton-drive",

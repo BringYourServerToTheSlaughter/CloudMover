@@ -80,6 +80,7 @@ def upload_specific(db: Path, migration_id: str, relative_path: str,
         base = proton.ensure_folder(parent or "/",name)
         if remote_cache is not None: remote_cache.add(base)
     remote_parent, remote_file = ensure_remote_tree(base, item.relative_path, remote_cache)
+    proton.assert_no_remote_file(remote_file)
     timings["path_setup"]=perf_counter()-t
     transition_file(db,item.migration_id,item.relative_path,TransferState.UPLOADING,increment_attempts=True)
     try:
@@ -105,6 +106,7 @@ def upload_one(db:Path,dest_parent:str="/my-files/CloudMover-Test")->Item:
     parent,name=dest_parent.rsplit("/",1)
     base = proton.ensure_folder(parent or "/",name)
     remote_parent, remote_file = ensure_remote_tree(base, item.relative_path)
+    proton.assert_no_remote_file(remote_file)
     transition_file(db,item.migration_id,item.relative_path,TransferState.UPLOADING,increment_attempts=True)
     try:
         proton.upload(local,remote_parent)
@@ -124,7 +126,7 @@ def main():
     ap.add_argument("--db",type=Path,default=Path(".cloudmover/migration.db"))
     ap.add_argument("--destination",default="/my-files/CloudMover-Test")
     a=ap.parse_args()
-    print("CloudMover 0.19.3\n\nSingle-file Proton upload trial")
+    print("CloudMover 0.19.5\n\nSingle-file Proton upload trial")
     item=pick(a.db)
     print(f"File:        {item.relative_path}")
     print(f"Destination: {a.destination}")

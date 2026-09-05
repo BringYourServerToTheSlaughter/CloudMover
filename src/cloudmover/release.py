@@ -157,7 +157,7 @@ def main():
     ap.add_argument("--timeout",type=float,default=120)
     a=ap.parse_args()
 
-    print("CloudMover 0.19.3\n")
+    print("CloudMover 0.19.5\n")
     print("Single-file SMART_STAGING release trial")
     item=select_one(a.db)
     print(f"File:       {item.relative_path}")
