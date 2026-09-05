@@ -1,13 +1,14 @@
 from __future__ import annotations
-import argparse, os, signal, subprocess, sys, shutil, time
+import argparse, os, signal, subprocess, sys, shutil, time, uuid
+from datetime import datetime
 from pathlib import Path
 
 from .scanner import human_bytes, walk_entries
-from .state import connect, create_schema, initialize_migration, reconcile_migration_inventory
+from .state import connect, create_schema, initialize_migration, reconcile_migration_inventory, get_activity_progress, recover_stale_runtime_state
 from .providers.icloud import inspect_file, HydrationState
 from .app_paths import default_db_path, ensure_app_support
 
-VERSION="0.19.3"
+VERSION="0.19.5"
 
 def snapshot(db_path: Path) -> dict:
     conn=connect(db_path)
@@ -45,20 +46,28 @@ def snapshot(db_path: Path) -> dict:
                  AND transfer_state IN ('HYDRATING','UPLOADING','VERIFYING')""",
             (mid,)).fetchone()["b"])
         released=conn.execute(
-            """SELECT COUNT(*) n FROM files
+            """SELECT COUNT(*) n, COALESCE(SUM(logical_bytes),0) b FROM files
                WHERE migration_id=? AND selected=1 AND local_released=1""",(mid,)).fetchone()
         failed=conn.execute(
             """SELECT COUNT(*) n FROM files
                WHERE migration_id=? AND selected=1 AND transfer_state='FAILED'""",(mid,)).fetchone()
+        failed_rows=conn.execute(
+            """SELECT relative_path,last_error
+               FROM files
+               WHERE migration_id=? AND selected=1 AND transfer_state='FAILED'
+               ORDER BY updated_at DESC, relative_path ASC
+               LIMIT 6""",(mid,)).fetchall()
         verified=conn.execute(
             """SELECT COUNT(*) n FROM files
                WHERE migration_id=? AND selected=1 AND verified=1""",(mid,)).fetchone()
+        activity=get_activity_progress(db_path)
         return dict(
             m=m, done=done, active=active, active_count=active_count,
             active_bytes=active_bytes, released=released,
             selected_files=int(totals["n"]), selected_bytes=int(totals["b"]),
             all_files=int(all_totals["n"]), all_bytes=int(all_totals["b"]),
-            failed_files=int(failed["n"]), verified_files=int(verified["n"])
+            failed_files=int(failed["n"]), verified_files=int(verified["n"]),
+            failed_rows=failed_rows, activity=activity
         )
     finally:
         conn.close()
@@ -117,6 +126,21 @@ def migration_has_started(db_path: Path) -> bool:
     finally:
         conn.close()
 
+def elapsed_between(start, end) -> str:
+    try:
+        started=datetime.fromisoformat(str(start))
+        finished=datetime.fromisoformat(str(end))
+    except (TypeError,ValueError):
+        return "Unknown"
+    seconds=max(0,int((finished-started).total_seconds()))
+    hours,seconds=divmod(seconds,3600)
+    minutes,seconds=divmod(seconds,60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
 
 def source_directories(source: Path) -> list[str]:
     """Return the live iCloud directory hierarchy, including empty folders."""
@@ -168,9 +192,39 @@ def has_migration(db_path: Path) -> bool:
 def default_icloud_path() -> Path:
     return Path.home()/"Library/Mobile Documents/com~apple~CloudDocs"
 
+def find_proton_drive_cli() -> str | None:
+    found=shutil.which("proton-drive")
+    if found:
+        return found
+    for candidate in (
+        "/usr/local/bin/proton-drive",
+        "/opt/homebrew/bin/proton-drive",
+    ):
+        path=Path(candidate)
+        if path.is_file() and os.access(path,os.X_OK):
+            return str(path)
+    return None
+
+def validate_proton_destination(path: str) -> tuple[bool, str]:
+    path=(path or "").strip()
+    if not path:
+        return False,"Enter a Proton destination."
+    if not path.startswith("/my-files/"):
+        return False,"Destination must start with /my-files/."
+    if path.rstrip("/") == "/my-files":
+        return False,"Choose a folder inside /my-files, not /my-files itself."
+    if path.endswith("/"):
+        return False,"Remove the trailing slash from the destination."
+    parts=path.split("/")
+    if "" in parts[1:]:
+        return False,"Destination cannot contain empty path segments."
+    if any(part in (".","..") for part in parts):
+        return False,"Destination cannot contain . or .. path segments."
+    return True,"Using a dedicated CloudMover migration folder reduces collision risk."
+
 def main():
     try:
-        from PySide6.QtCore import QTimer, Qt
+        from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
         from PySide6.QtWidgets import (
             QApplication,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QProgressBar,
             QFrame,QPushButton,QTreeWidget,QTreeWidgetItem,QSplitter,QLineEdit,
@@ -179,13 +233,49 @@ def main():
     except ImportError:
         raise SystemExit("CloudMover GUI requires PySide6. Install with: python3 -m pip install PySide6")
 
+    class MigrationScanWorker(QObject):
+        progress=Signal(object)
+        finished=Signal(object,object)
+        failed=Signal(str)
+
+        def __init__(self,source,db_path,destination):
+            super().__init__()
+            self.source=source
+            self.db_path=db_path
+            self.destination=destination
+            self.started_at=0.0
+            self.last_progress=0.0
+            self.latest_progress={}
+
+        @Slot()
+        def run(self):
+            try:
+                self.started_at=time.monotonic()
+                self.last_progress=0.0
+                def report(progress):
+                    now=time.monotonic()
+                    payload=dict(progress)
+                    payload["elapsed"]=now-self.started_at
+                    self.latest_progress=payload
+                    if not payload.get("final") and now-self.last_progress < 0.125:
+                        return
+                    self.last_progress=now
+                    self.progress.emit(payload)
+                summary=initialize_migration(self.source,self.db_path,self.destination,report)
+                self.finished.emit(summary,self.latest_progress)
+            except Exception as exc:
+                self.failed.emit(str(exc))
+
     class SetupDialog(QDialog):
         """First-run wizard for the v1 product scope: iCloud Drive → Proton Drive."""
         def __init__(self,db_path):
             super().__init__()
             self.db_path=db_path
             self.source=default_icloud_path()
-            self.destination="/my-files"
+            self.destination=f"/my-files/CloudMover/{uuid.uuid4()}"
+            self.scan_thread=None
+            self.scan_worker=None
+            self.scan_summary=None
             self.setWindowTitle(f"CloudMover {VERSION} — Set Up Migration")
             self.resize(760,560)
             self.setMinimumSize(680,500)
@@ -194,8 +284,12 @@ def main():
               QLabel#hero { font-size:28px; font-weight:700; color:#f8fafc; }
               QLabel#step { font-size:20px; font-weight:650; color:#f8fafc; }
               QLabel#muted { color:#cbd5e1; }
+              QLabel#sourceTitle { font-size:16px; font-weight:700; color:#f8fafc; }
+              QLabel#sourceChanged { color:#fde68a; font-weight:650; }
               QPushButton { border-radius:8px; padding:10px 18px; font-weight:700;
-                            color:white; background:#0f9f7f; border:1px solid #22d3a6; }
+                            color:#f8fafc; background:#17324c; border:1px solid #47617b; }
+              QPushButton#primaryButton { color:white; background:#2563eb; border:1px solid #60a5fa; }
+              QPushButton#secondaryButton { color:#e5edf6; background:#12273d; border:1px solid #3d536b; }
               QPushButton:disabled { color:#8190a5; background:#183047; border:1px solid #334a60; }
               QLineEdit { background:#10283f; border:1px solid #405269; border-radius:8px;
                           padding:9px 12px; color:#f8fafc; }
@@ -216,8 +310,17 @@ def main():
             # System check
             p=QWidget(); l=QVBoxLayout(p)
             t=QLabel("System check"); t.setObjectName("step"); l.addWidget(t)
+            self.source_title=QLabel(); self.source_title.setObjectName("sourceTitle"); self.source_title.setWordWrap(True); l.addWidget(self.source_title)
+            self.source_path=QLabel(); self.source_path.setObjectName("muted"); self.source_path.setWordWrap(True); l.addWidget(self.source_path)
+            self.source_note=QLabel(); self.source_note.setObjectName("sourceChanged"); self.source_note.setWordWrap(True); l.addWidget(self.source_note)
             self.check_text=QLabel(); self.check_text.setObjectName("muted"); self.check_text.setWordWrap(True); l.addWidget(self.check_text)
-            choose=QPushButton("Choose a Different iCloud Folder"); choose.clicked.connect(self.choose_source); l.addWidget(choose)
+            choose=QPushButton("Choose a Different iCloud Folder"); choose.setObjectName("secondaryButton"); choose.clicked.connect(self.choose_source); l.addWidget(choose)
+            dest_label=QLabel("Proton destination"); dest_label.setObjectName("muted"); l.addWidget(dest_label)
+            self.dest_edit=QLineEdit(self.destination)
+            self.dest_edit.setPlaceholderText("/my-files/CloudMover/your-migration")
+            self.dest_edit.textChanged.connect(self.destination_changed)
+            l.addWidget(self.dest_edit)
+            self.dest_help=QLabel(); self.dest_help.setObjectName("muted"); self.dest_help.setWordWrap(True); l.addWidget(self.dest_help)
             l.addStretch(); self.pages.addWidget(p)
 
             # Scan/review
@@ -226,6 +329,10 @@ def main():
             q=QLabel("CloudMover will inventory file names, sizes, and iCloud hydration state without intentionally downloading cloud-only file contents.")
             q.setObjectName("muted"); q.setWordWrap(True); l.addWidget(q)
             self.scan_text=QLabel("Ready to scan."); self.scan_text.setObjectName("muted"); self.scan_text.setWordWrap(True); l.addWidget(self.scan_text)
+            self.scan_bar=QProgressBar(); self.scan_bar.setTextVisible(False); self.scan_bar.hide(); l.addWidget(self.scan_bar)
+            self.scan_activity=QLabel(""); self.scan_activity.setObjectName("muted"); self.scan_activity.setWordWrap(True); l.addWidget(self.scan_activity)
+            self.scan_reassurance=QLabel("No files are being moved yet.\nCloud-only files are not downloaded during this scan.")
+            self.scan_reassurance.setObjectName("muted"); self.scan_reassurance.setWordWrap(True); l.addWidget(self.scan_reassurance)
             l.addStretch(); self.pages.addWidget(p)
 
             # Review
@@ -238,8 +345,8 @@ def main():
             l.addStretch(); self.pages.addWidget(p)
 
             nav=QHBoxLayout()
-            self.back=QPushButton("Back"); self.back.clicked.connect(self.go_back)
-            self.next=QPushButton("Get Started"); self.next.clicked.connect(self.go_next)
+            self.back=QPushButton("Back"); self.back.setObjectName("secondaryButton"); self.back.clicked.connect(self.go_back)
+            self.next=QPushButton("Get Started"); self.next.setObjectName("primaryButton"); self.next.clicked.connect(self.go_next)
             nav.addWidget(self.back); nav.addStretch(); nav.addWidget(self.next); lay.addLayout(nav)
             self.refresh_page()
 
@@ -247,17 +354,33 @@ def main():
             chosen=QFileDialog.getExistingDirectory(self,"Choose iCloud Drive",str(self.source))
             if chosen:
                 self.source=Path(chosen)
+                self.scan_summary=None
+                self.refresh_page()
+
+        def destination_changed(self,text):
+            self.destination=str(text).strip()
+            self.scan_summary=None
+            if self.pages.currentIndex()==1:
                 self.refresh_page()
 
         def checks(self):
             source_ok=self.source.exists() and self.source.is_dir()
-            proton=shutil.which("proton-drive")
+            proton=find_proton_drive_cli()
             free=0
             try:
                 if source_ok:
                     u=os.statvfs(self.source); free=u.f_bavail*u.f_frsize
             except OSError: pass
             return source_ok,proton,free
+
+        def source_changed_from_default(self):
+            try:
+                return self.source.expanduser().resolve() != default_icloud_path().expanduser().resolve()
+            except OSError:
+                return Path(self.source).expanduser() != default_icloud_path().expanduser()
+
+        def source_folder_name(self):
+            return self.source.name or str(self.source)
 
         def refresh_page(self):
             i=self.pages.currentIndex()
@@ -266,6 +389,14 @@ def main():
                 self.next.setText("Get Started")
             elif i==1:
                 source_ok,proton,free=self.checks()
+                destination_ok,destination_message=validate_proton_destination(self.destination)
+                self.source_title.setText(f"Selected source: {self.source_folder_name()}")
+                self.source_path.setText(f"Full path: {self.source}")
+                self.source_note.setText(
+                    "Custom source selected — this is different from the default iCloud Drive root."
+                    if self.source_changed_from_default() else
+                    "Default iCloud Drive root selected."
+                )
                 self.check_text.setText(
                     f"{'✓' if source_ok else '✕'} iCloud Drive: {self.source}\n"
                     f"{'✓' if proton else '✕'} Proton Drive command-line service: {'available' if proton else 'not found'}\n"
@@ -273,16 +404,31 @@ def main():
                     f"✕ iCloud Drive folder not found: {self.source}\n"
                     f"{'✓' if proton else '✕'} Proton Drive command-line service: {'available' if proton else 'not found'}"
                 )
+                self.dest_help.setText(
+                    f"{'✓' if destination_ok else '✕'} {destination_message}"
+                )
                 self.next.setText("Continue")
-                self.next.setEnabled(bool(source_ok and proton))
+                self.next.setEnabled(bool(source_ok and proton and destination_ok))
             elif i==2:
-                self.next.setText("Scan iCloud Drive")
-                self.next.setEnabled(True)
+                self.next.setText("Review Migration" if self.scan_summary else "Scan iCloud Drive")
+                self.next.setEnabled(bool(self.scan_summary) or not self.scan_running())
             else:
                 self.next.setText("Choose Files")
                 self.next.setEnabled(True)
 
+        def scan_running(self):
+            return self.scan_thread is not None and self.scan_thread.isRunning()
+
+        def elide_path(self,path,limit=84):
+            path=str(path or "")
+            if len(path)<=limit:
+                return path
+            keep=max(10,(limit-3)//2)
+            return f"{path[:keep]}...{path[-keep:]}"
+
         def go_back(self):
+            if self.scan_running():
+                return
             if self.pages.currentIndex()>0:
                 self.pages.setCurrentIndex(self.pages.currentIndex()-1)
                 self.refresh_page()
@@ -290,28 +436,100 @@ def main():
         def go_next(self):
             i=self.pages.currentIndex()
             if i<2:
+                if i==1:
+                    ok,msg=validate_proton_destination(self.destination)
+                    if not ok:
+                        QMessageBox.warning(self,"Check Proton destination",msg)
+                        self.refresh_page()
+                        return
                 self.pages.setCurrentIndex(i+1); self.refresh_page(); return
             if i==2:
+                if self.scan_running():
+                    return
+                if self.scan_summary:
+                    self.show_scan_review()
+                    return
                 self.next.setEnabled(False); self.back.setEnabled(False)
                 self.scan_text.setText("Scanning iCloud Drive… this can take a few minutes for a large library.")
-                QApplication.processEvents()
-                try:
-                    summary=initialize_migration(self.source,self.db_path,self.destination)
-                    self.review.setText(
-                        f"{summary.files:,} files found\n"
-                        f"{human_bytes(summary.logical_bytes)} total\n"
-                        f"Strategy: {summary.strategy.replace('_',' ').title()}\n"
-                        f"Protected disk reserve: {human_bytes(summary.reserve_bytes)}\n\n"
-                        "Next, choose exactly which files and folders you want to migrate."
-                    )
-                    self.pages.setCurrentIndex(3)
-                    self.back.setEnabled(False)
-                    self.refresh_page()
-                except Exception as exc:
-                    QMessageBox.critical(self,"Scan failed",str(exc))
-                    self.next.setEnabled(True); self.back.setEnabled(True)
+                self.scan_activity.setText("Preparing scan…")
+                self.scan_bar.setRange(0,0)
+                self.scan_bar.show()
+                self.scan_summary=None
+                self.destination=self.destination.strip()
+                self.scan_thread=QThread(self)
+                self.scan_worker=MigrationScanWorker(self.source,self.db_path,self.destination)
+                self.scan_worker.moveToThread(self.scan_thread)
+                self.scan_thread.started.connect(self.scan_worker.run)
+                self.scan_worker.progress.connect(self.scan_progress)
+                self.scan_worker.finished.connect(self.scan_finished)
+                self.scan_worker.failed.connect(self.scan_failed)
+                self.scan_worker.finished.connect(self.scan_thread.quit)
+                self.scan_worker.failed.connect(self.scan_thread.quit)
+                self.scan_worker.finished.connect(self.scan_worker.deleteLater)
+                self.scan_worker.failed.connect(self.scan_worker.deleteLater)
+                self.scan_thread.finished.connect(self.scan_thread.deleteLater)
+                self.scan_thread.start()
                 return
             self.accept()
+
+        def scan_progress(self,progress):
+            self.scan_activity.setText(
+                f"Now scanning: {self.elide_path(progress.get('relative_path',''))}\n"
+                f"Files: {int(progress.get('files',0)):,} • "
+                f"Folders: {int(progress.get('folders',0)):,} • "
+                f"Logical bytes: {human_bytes(int(progress.get('logical_bytes',0)))} • "
+                f"Cloud-only files: {int(progress.get('cloud_only',0)):,} • "
+                f"Elapsed: {int(progress.get('elapsed',0))}s"
+            )
+
+        def scan_finished(self,summary,progress):
+            self.scan_thread=None
+            self.scan_worker=None
+            files=int(progress.get("files",summary.files)) if progress else summary.files
+            folders=int(progress.get("folders",0)) if progress else 0
+            logical_bytes=int(progress.get("logical_bytes",summary.logical_bytes)) if progress else summary.logical_bytes
+            cloud_only=int(progress.get("cloud_only",0)) if progress else 0
+            self.scan_summary={
+                "summary":summary,
+                "source_folder":self.source_folder_name(),
+                "source":str(self.source),
+                "destination":self.destination,
+                "files":files,
+                "folders":folders,
+                "logical_bytes":logical_bytes,
+                "cloud_only":cloud_only,
+            }
+            self.scan_text.setText(
+                f"Scan complete — {files:,} files • {human_bytes(logical_bytes)}"
+            )
+            self.scan_bar.hide()
+            self.scan_activity.setText(
+                f"Selected source folder: {self.scan_summary['source_folder']} ({self.scan_summary['source']})\n"
+                f"Proton destination: {self.scan_summary['destination']}\n"
+                f"Files found: {files:,} • Folders found: {folders:,} • "
+                f"Logical size: {human_bytes(logical_bytes)} • Cloud-only files found: {cloud_only:,}"
+            )
+            self.review.setText(
+                f"{summary.files:,} files found\n"
+                f"{human_bytes(summary.logical_bytes)} total\n"
+                f"Strategy: {summary.strategy.replace('_',' ').title()}\n"
+                f"Protected disk reserve: {human_bytes(summary.reserve_bytes)}\n\n"
+                "Next, choose exactly which files and folders you want to migrate."
+            )
+            self.back.setEnabled(True)
+            self.refresh_page()
+
+        def show_scan_review(self):
+            self.pages.setCurrentIndex(3)
+            self.back.setEnabled(False)
+            self.refresh_page()
+
+        def scan_failed(self,message):
+            self.scan_thread=None
+            self.scan_worker=None
+            self.scan_bar.hide()
+            QMessageBox.critical(self,"Scan failed",message)
+            self.next.setEnabled(True); self.back.setEnabled(True)
 
     class Window(QWidget):
         def __init__(self,db_path):
@@ -326,6 +544,8 @@ def main():
               QLabel#title { color:#f8fafc; font-size:30px; font-weight:700; }
               QLabel#route { color:#cbd5e1; font-size:16px; }
               QLabel#status { color:#f1f5f9; font-size:20px; font-weight:600; }
+              QLabel#completionTitle { color:#bbf7d0; font-size:24px; font-weight:800; }
+              QLabel#completionDetail { color:#e2e8f0; line-height:150%; }
               QLabel#muted { color:#cbd5e1; }
               QLabel#safety { color:#dbeafe; }
               QProgressBar { height:18px; border:0; border-radius:9px; background:#405269; }
@@ -334,6 +554,8 @@ def main():
               QPushButton { border-radius:8px; padding:10px 18px; font-weight:700; color:white; }
               QPushButton#resumeButton { background:#0f9f7f; border:1px solid #22d3a6; }
               QPushButton#resumeButton:hover { background:#10b98f; }
+              QPushButton#newMigrationButton { background:#0f9f7f; border:1px solid #22d3a6; }
+              QPushButton#newMigrationButton:hover { background:#10b98f; }
               QPushButton#pauseButton { background:#b76518; border:1px solid #f59e0b; }
               QPushButton#pauseButton:hover { background:#d1781e; }
               QPushButton:disabled { color:#8190a5; background:#183047; border:1px solid #334a60; }
@@ -395,8 +617,13 @@ def main():
 
             self.stage=QLabel(); self.stage.setObjectName("status"); lay.addWidget(self.stage)
             self.current=QLabel(); self.current.setWordWrap(True); self.current.setObjectName("muted"); lay.addWidget(self.current)
+            self.completion_title=QLabel(); self.completion_title.setObjectName("completionTitle"); self.completion_title.hide(); lay.addWidget(self.completion_title)
+            self.completion_detail=QLabel(); self.completion_detail.setObjectName("completionDetail"); self.completion_detail.setWordWrap(True); self.completion_detail.hide(); lay.addWidget(self.completion_detail)
             self.filebar=QProgressBar(); self.filebar.setTextVisible(False); self.filebar.hide(); lay.addWidget(self.filebar)
             self.fileprogress=QLabel(); self.fileprogress.setObjectName("muted"); self.fileprogress.hide(); lay.addWidget(self.fileprogress)
+
+            self.attention_title=QLabel("Needs attention"); self.attention_title.setObjectName("status"); lay.addWidget(self.attention_title)
+            self.attention=QLabel(); self.attention.setObjectName("muted"); self.attention.setWordWrap(True); lay.addWidget(self.attention)
 
             self.safety=QLabel(); self.safety.setObjectName("safety"); self.safety.setWordWrap(True); lay.addWidget(self.safety)
 
@@ -404,9 +631,11 @@ def main():
             controls=QHBoxLayout()
             self.resume_btn=QPushButton("Start Migration"); self.resume_btn.setObjectName("resumeButton")
             self.pause_btn=QPushButton("Paused"); self.pause_btn.setObjectName("pauseButton")
+            self.new_btn=QPushButton("New Migration..."); self.new_btn.setObjectName("newMigrationButton")
             self.resume_btn.clicked.connect(self.primary_action)
             self.pause_btn.clicked.connect(self.secondary_action)
-            controls.addWidget(self.resume_btn); controls.addWidget(self.pause_btn); controls.addStretch()
+            self.new_btn.clicked.connect(self.new_migration)
+            controls.addWidget(self.resume_btn); controls.addWidget(self.pause_btn); controls.addWidget(self.new_btn); controls.addStretch()
             lay.addLayout(controls)
             self.notice=QLabel(""); self.notice.setObjectName("muted"); self.notice.setWordWrap(True); lay.addWidget(self.notice)
 
@@ -420,15 +649,40 @@ def main():
             self.root_stack.addWidget(self.setup_page)
 
             self.timer=QTimer(self); self.timer.timeout.connect(self.refresh); self.timer.start(1000)
-            self.load_selection_tree()
+            try:
+                recovered=self.repair_stale_runtime_if_needed()
+                if any(recovered.values()):
+                    self.notice.setText(
+                        "Recovered interrupted work • "
+                        f"{recovered['HYDRATING']} hydrating • "
+                        f"{recovered['UPLOADING']} uploading • "
+                        f"{recovered['VERIFYING']} verifying."
+                    )
+            except Exception as exc:
+                self.notice.setText(f"Recovery check failed: {exc}")
+            self.load_selection_tree(reconcile_live=False, include_live_directories=False)
             self.refresh()
 
         def pid_path(self): return self.db_path.with_name(self.db_path.stem + ".engine.pid")
 
         def live_engine_pid(self):
+            path=self.pid_path()
             try:
-                pid=int(self.pid_path().read_text().strip()); os.kill(pid,0); return pid
-            except (OSError,ValueError): return None
+                pid=int(path.read_text().strip())
+                os.kill(pid,0)
+                return pid
+            except (OSError,ValueError):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+
+        def repair_stale_runtime_if_needed(self):
+            """If no worker exists, make DB/UI state truthfully paused and retry-safe."""
+            if self.live_engine_pid():
+                return {"HYDRATING":0,"UPLOADING":0,"VERIFYING":0}
+            return recover_stale_runtime_state(self.db_path)
 
         def stop_engine_for_app_exit(self, grace_seconds=4.0):
             """Stop this database's engine before the GUI process exits."""
@@ -436,7 +690,7 @@ def main():
             if not pid:
                 return
             try:
-                os.kill(pid,signal.SIGINT)
+                os.killpg(pid,signal.SIGINT)
             except OSError:
                 return
 
@@ -451,7 +705,7 @@ def main():
 
             # Graceful pause did not finish. Durable state recovery makes TERM safe.
             try:
-                os.kill(pid,signal.SIGTERM)
+                os.killpg(pid,signal.SIGTERM)
             except OSError:
                 return
 
@@ -466,7 +720,7 @@ def main():
 
             # Last resort: never leave an invisible migration engine behind.
             try:
-                os.kill(pid,signal.SIGKILL)
+                os.killpg(pid,signal.SIGKILL)
             except OSError:
                 pass
 
@@ -483,7 +737,7 @@ def main():
             except Exception:
                 status=""
             if status=="COMPLETE":
-                self.new_migration()
+                self.notice.setText("This migration is complete. Choose New Migration... to create another migration plan.")
             else:
                 self.resume_migration()
 
@@ -502,6 +756,21 @@ def main():
             if self.live_engine_pid():
                 self.notice.setText("Pause the active migration before starting a new one.")
                 return
+            try:
+                status=str(snapshot(self.db_path)["m"]["status"]).upper()
+            except Exception:
+                status=""
+            if status!="COMPLETE":
+                answer=QMessageBox.question(
+                    self,
+                    "Create New Migration",
+                    "The existing paused migration will remain unchanged in history.\n\n"
+                    "The new migration will become the active migration.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer!=QMessageBox.Yes:
+                    return
             # Recreate setup state in this same window.
             self.setup_page=SetupDialog(self.db_path)
             self.setup_page.setWindowFlags(Qt.Widget)
@@ -544,22 +813,28 @@ def main():
                 self.resume_btn.setEnabled(False)
                 self.pause_btn.setText("Pause Migration")
                 self.pause_btn.setEnabled(True)
+                self.new_btn.setVisible(False)
+                self.new_btn.setEnabled(False)
                 self.tree.setEnabled(False)
                 if self.notice.text().startswith("Resuming"):
                     self.notice.setText("✓ Migration resumed safely • engine is running.")
             elif status=="COMPLETE":
-                self.resume_btn.setText("New Migration")
-                self.resume_btn.setEnabled(True)
+                self.resume_btn.setText("Completed")
+                self.resume_btn.setEnabled(False)
                 self.pause_btn.setText("View Report")
                 self.pause_btn.setEnabled(True)
+                self.new_btn.setVisible(True)
+                self.new_btn.setEnabled(True)
                 self.tree.setEnabled(False)
                 if self.notice.text().startswith(("Starting","Resuming","Pausing")):
-                    self.notice.setText("✓ Migration completed successfully.")
+                    self.notice.setText("Migration complete.")
             else:
                 self.resume_btn.setText("Resume Migration" if migration_has_started(self.db_path) else "Start Migration")
                 self.resume_btn.setEnabled(True)
                 self.pause_btn.setText("Paused")
                 self.pause_btn.setEnabled(False)
+                self.new_btn.setVisible(True)
+                self.new_btn.setEnabled(True)
                 self.tree.setEnabled(True)
                 if self.notice.text().startswith("Pausing"):
                     self.notice.setText("✓ Paused safely • selection is unlocked.")
@@ -573,7 +848,7 @@ def main():
                 self.notice.setText("Pausing… stopping the active transfer safely.")
                 self.pause_btn.setText("Pausing…")
                 self.pause_btn.setEnabled(False); self.resume_btn.setEnabled(False)
-                os.kill(pid,signal.SIGINT)
+                os.killpg(pid,signal.SIGINT)
                 QTimer.singleShot(4000,lambda p=pid:self._escalate_pause(p))
             except OSError as exc:
                 self.notice.setText(f"Could not request pause: {exc}")
@@ -581,7 +856,7 @@ def main():
         def _escalate_pause(self,pid):
             if self.live_engine_pid()!=pid: return
             try:
-                os.kill(pid,signal.SIGTERM)
+                os.killpg(pid,signal.SIGTERM)
                 self.notice.setText("Pause required a forced stop • migration remains recoverable.")
             except OSError:
                 pass
@@ -589,23 +864,31 @@ def main():
         def resume_migration(self):
             if self.live_engine_pid():
                 self.notice.setText("CloudMover is already running."); return
+
+            # Order is critical: repair stale transient/RUNNING state while there is
+            # no worker, reconcile inventory while PAUSED, and only then launch.
             try:
+                recovered=self.repair_stale_runtime_if_needed()
                 reconcile_migration_inventory(self.db_path)
             except Exception as exc:
-                self.notice.setText(f"Could not refresh iCloud Drive before start: {exc}")
+                self.notice.setText(f"Could not prepare migration for start: {exc}")
                 return
+
             first_start=not migration_has_started(self.db_path)
             if first_start:
                 self.notice.setText("Starting migration…")
                 self.resume_btn.setText("Starting…")
             else:
-                self.notice.setText("Resuming… recovery checks are running.")
+                recovered_total=sum(recovered.values())
+                self.notice.setText(
+                    f"Resuming… recovered {recovered_total:,} interrupted file(s); starting worker."
+                )
                 self.resume_btn.setText("Resuming…")
             self.resume_btn.setEnabled(False); self.pause_btn.setEnabled(False)
             common=[
                 "--db",str(self.db_path),
                 "--target-mb","250",
-                "--batch","250",
+                "--batch","5000",
                 "--reserve-gb","20",
             ]
             if getattr(sys,"frozen",False):
@@ -621,7 +904,7 @@ def main():
             except OSError as exc:
                 self.notice.setText(f"Could not resume migration: {exc}")
 
-        def load_selection_tree(self):
+        def load_selection_tree(self, reconcile_live=False, include_live_directories=False):
             m,rows=selection_rows(self.db_path)
             self._selection_loading=True
             self.tree.clear()
@@ -629,7 +912,7 @@ def main():
                 self._selection_loading=False; return
 
             status=str(m["status"]).upper()
-            if status not in ("RUNNING","COMPLETE"):
+            if reconcile_live and status not in ("RUNNING","COMPLETE"):
                 try:
                     changes=reconcile_migration_inventory(self.db_path)
                     if any(changes.values()):
@@ -641,7 +924,7 @@ def main():
                 except Exception as exc:
                     self.notice.setText(f"Could not refresh iCloud inventory: {exc}")
 
-            directories=source_directories(Path(str(m["source"])))
+            directories=source_directories(Path(str(m["source"]))) if include_live_directories else []
             index=build_tree_index(rows,directories)
 
             root_item=QTreeWidgetItem(["iCloud Drive",human_bytes(index["bytes"]),""])
@@ -719,6 +1002,31 @@ def main():
             for i in range(self.tree.topLevelItemCount()):
                 visit(self.tree.topLevelItem(i))
 
+        def completion_summary_text(self,s,m):
+            destination=str(m["destination"] or "Not set")
+            completed_bytes=int(s["done"]["b"])
+            released_count=int(s["released"]["n"])
+            released_bytes=int(s["released"]["b"])
+            released_line=(
+                f"Local iCloud cache released: {released_count:,} file(s), {human_bytes(released_bytes)}"
+                if released_count else
+                "Local iCloud cache released: none recorded"
+            )
+            return (
+                f"Source path: {m['source']}\n"
+                f"Proton destination: {destination}\n"
+                f"Total selected files: {s['selected_files']:,}\n"
+                f"Completed files: {int(s['done']['n']):,}\n"
+                f"Verified files: {s['verified_files']:,}\n"
+                f"Failed files: {s['failed_files']:,}\n"
+                f"Total logical bytes migrated: {human_bytes(completed_bytes)}\n"
+                f"{released_line}\n"
+                f"Migration start time: {m['created_at']}\n"
+                f"Completion time: {m['updated_at']}\n"
+                f"Elapsed duration: {elapsed_between(m['created_at'],m['updated_at'])}\n\n"
+                "Source files remain in iCloud. Verified Proton copies were required before local cache release."
+            )
+
         def refresh(self):
             try:
                 s=snapshot(self.db_path); m=s["m"]; d=s["done"]; a=s["active"]
@@ -733,9 +1041,35 @@ def main():
                     f'{human_bytes(done)} / {human_bytes(total)} selected')
                 self.pick_summary.setText(
                     f'{s["selected_files"]:,} files • {human_bytes(s["selected_bytes"])} selected')
+                failed_files=int(s.get("failed_files",0))
+                failed_rows=s.get("failed_rows") or []
+                if failed_files:
+                    lines=[f"{failed_files:,} failed file(s). Source iCloud files remain safe and are not deleted."]
+                    for row in failed_rows:
+                        err=str(row["last_error"] or "No error message recorded.")
+                        lines.append(f"- {row['relative_path']}: {err}")
+                    if failed_files > len(failed_rows):
+                        lines.append(f"- {failed_files-len(failed_rows):,} more failed file(s) not shown.")
+                    lines.append("Fix the underlying issue, then start or resume CloudMover to retry safe pending work.")
+                    self.attention.setText("\n".join(lines))
+                else:
+                    self.attention.setText("No failed files. If an item fails later, CloudMover will keep the source iCloud file safe and show the latest error here.")
 
-                status=str(m["status"]).upper()
+                db_status=str(m["status"]).upper()
                 live=self.live_engine_pid() is not None
+
+                # Runtime truth wins over stale database text. A migration cannot be
+                # visibly RUNNING when there is no worker process.
+                status="RUNNING" if live else db_status
+                if not live and db_status=="RUNNING":
+                    recovered=self.repair_stale_runtime_if_needed()
+                    s=snapshot(self.db_path); m=s["m"]; d=s["done"]; a=s["active"]
+                    status=str(m["status"]).upper()
+                    if any(recovered.values()) and not self.notice.text().startswith("Recovered"):
+                        self.notice.setText(
+                            f"Recovered {sum(recovered.values()):,} interrupted file(s) • ready to resume."
+                        )
+
                 self.set_control_state(status,live)
                 if status=="COMPLETE":
                     self.pick_help.setText("Completed migration history. Choose New Migration to create another migration plan.")
@@ -747,25 +1081,45 @@ def main():
                 if status!="RUNNING":
                     self.filebar.hide(); self.fileprogress.hide()
                     if status=="COMPLETE":
-                        self.stage.setText("Migration complete ✓")
+                        self.completion_title.show()
+                        self.completion_detail.show()
+                        self.status.setText("Complete")
+                        self.bar.setValue(10000 if total else 0)
+                        self.stage.setText("Migration finished")
+                        if failed_files:
+                            self.completion_title.setText("Completed with attention needed")
+                            completion_notice=f"Migration completed with {failed_files:,} failed file(s)."
+                        else:
+                            self.completion_title.setText("Migration completed successfully")
+                            completion_notice="Migration completed successfully. No further action is required."
+                        self.completion_detail.setText(self.completion_summary_text(s,m))
                         self.current.setText(
                             f"{s['selected_files']:,} selected files • "
                             f"{human_bytes(s['selected_bytes'])} • "
                             f"{s['verified_files']:,} verified • {s['failed_files']:,} failed"
                         )
                         if not self.notice.text() or self.notice.text().startswith(("Starting","Resuming","Pausing")):
-                            self.notice.setText("✓ Migration completed successfully.")
+                            self.notice.setText(completion_notice)
                     else:
+                        self.completion_title.hide()
+                        self.completion_detail.hide()
                         self.stage.setText("Paused / ready")
-                        self.current.setText("Choose what to move, then start the migration.")
+                        queued=int(s.get("active_count",0))
+                        self.current.setText(
+                            "Choose what to move, then start the migration."
+                            if not queued else
+                            f"{queued:,} interrupted file(s) are queued for safe retry when you resume."
+                        )
                         if self.notice.text().startswith("Pausing"):
                             self.notice.setText("✓ Paused safely • selection is unlocked.")
                 elif a:
+                    self.completion_title.hide()
+                    self.completion_detail.hide()
                     state=str(a["transfer_state"])
                     self.stage.setText(state.title())
                     self.current.setText(
                         f'{a["relative_path"]}   •   {human_bytes(a["logical_bytes"])}   •   '
-                        f'batch: {s["active_count"]} file(s), {human_bytes(s["active_bytes"])}')
+                        f'active batch: {s["active_count"]:,} file(s) • {human_bytes(s["active_bytes"])}')
                     if self.notice.text().startswith("Resuming"):
                         self.notice.setText("✓ Migration resumed safely • recovery check complete.")
                     self.filebar.show(); self.fileprogress.show()
@@ -783,11 +1137,29 @@ def main():
                                 "Hydrated locally • finalizing state…" if fs.hydration is HydrationState.LOCAL
                                 else "Downloading from iCloud…")
                     else:
-                        self.filebar.setRange(0,0)
-                        self.fileprogress.setText(
-                            "Uploading batch to Proton…" if state=="UPLOADING"
-                            else "Verifying Proton copy…")
+                        activity=s.get("activity") or {}
+                        completed=int(activity.get("completed",0))
+                        total_units=int(activity.get("total",0))
+                        detail=str(activity.get("detail",""))
+                        a_stage=str(activity.get("stage",""))
+                        if total_units>0:
+                            progress=max(0.0,min(1.0,completed/total_units))
+                            self.filebar.setRange(0,1000)
+                            self.filebar.setValue(round(progress*1000))
+                            label="Verifying" if a_stage=="verify" else "Working"
+                            self.fileprogress.setText(
+                                f"{label}: {completed:,} of {total_units:,} • {progress*100:.1f}%"
+                                + (f" • {detail}" if detail else "")
+                            )
+                        else:
+                            self.filebar.setRange(0,0)
+                            self.fileprogress.setText(
+                                "Uploading batch to Proton… progress unavailable from Proton"
+                                if state=="UPLOADING" else "Working…"
+                            )
                 else:
+                    self.completion_title.hide()
+                    self.completion_detail.hide()
                     self.stage.setText("Preparing next batch…")
                     self.current.setText("CloudMover is running; selecting the next batch.")
                     self.filebar.show(); self.filebar.setRange(0,0); self.fileprogress.show()
