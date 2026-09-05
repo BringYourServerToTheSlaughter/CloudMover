@@ -408,7 +408,7 @@ allocation. Otherwise CloudMover uses an indeterminate activity indicator.
 
 No source-cloud deletion is introduced.
 
-## v0.19.3 — migration controls + selection tree
+## v0.19.6 — migration controls + selection tree
 
 The GUI is now the primary migration control surface.
 
@@ -424,7 +424,7 @@ The GUI is now the primary migration control surface.
 
 This release intentionally does not support changing selection while the engine is running.
 
-## v0.19.3 — picker usability polish
+## v0.19.6 — picker usability polish
 
 - Opens at 1200×850 with a larger minimum size.
 - Gives the file/folder picker substantially more vertical space by default.
@@ -433,7 +433,7 @@ This release intentionally does not support changing selection while the engine 
 - Adds Expand All and Collapse All controls.
 - Migration engine behavior is unchanged.
 
-## v0.19.3 — reliable pause controls + taller picker
+## v0.19.6 — reliable pause controls + taller picker
 
 - Long-running Proton uploads now run in a separate process group.
 - Ctrl+C and GUI Pause can interrupt the active Proton child instead of waiting
@@ -444,7 +444,7 @@ This release intentionally does not support changing selection while the engine 
 - Default window: 1260×930.
 - Picker gets ~650 px initial vertical space and remains draggable.
 
-## v0.19.3 — first-run experience
+## v0.19.6 — first-run experience
 
 CloudMover now has an initial onboarding path for the locked v1 scope:
 iCloud Drive → Proton Drive on macOS.
@@ -461,20 +461,20 @@ On a new database the GUI now:
 
 Existing migration databases skip onboarding and open directly in the proven migration monitor.
 
-## v0.19.3 — migration process isolation
+## v0.19.6 — migration process isolation
 
 Engine PID files are now scoped to each migration database. A fresh onboarding/test
 database can no longer mistake a real migration engine in the same `.cloudmover`
 directory for its own process.
 
-## v0.19.3 — selection safety hotfix
+## v0.19.6 — selection safety hotfix
 - Fixed critical byte-target scheduler omission: PENDING candidates now require selected=1.
 - Release backlog also respects selected=1.
 - Added executable regression tests proving deselected rows cannot enter the batch.
 - Pause escalates to SIGTERM after four seconds if graceful SIGINT does not stop the engine.
 - New migrations say Start Migration; previously-started migrations say Resume Migration.
 
-## v0.19.3 — destination + complete-selection safety
+## v0.19.6 — destination + complete-selection safety
 
 - The production engine now reads the Proton destination from the migration plan.
 - There is no default `CloudMover-013-Test` destination in normal engine startup.
@@ -485,7 +485,7 @@ directory for its own process.
 - Zero-byte and sub-1 MB selected files are no longer silently stranded.
 - The GUI displays the stored Proton destination beside the route.
 
-## v0.19.3 — completion workflow
+## v0.19.6 — completion workflow
 
 - COMPLETE is no longer a dead end.
 - The primary action becomes **New Migration**.
@@ -496,7 +496,7 @@ directory for its own process.
 - Stale Starting/Resuming/Pausing notices are cleared on completion.
 - Completed file selection is presented as migration history rather than editable work.
 
-## v0.19.3 — single-window lifecycle + reordered workspace
+## v0.19.6 — single-window lifecycle + reordered workspace
 
 - New Migration no longer opens a second/modal window.
 - Setup/onboarding now lives in the same main window using a stacked page layout.
@@ -507,7 +507,7 @@ directory for its own process.
   3. Controls
 - New/paused wording now says: “Choose what to move, then start the migration.”
 
-### v0.19.3 process lifecycle safety
+### v0.19.6 process lifecycle safety
 
 - Closing the CloudMover window pauses/stops the engine tied to that migration DB.
 - Ctrl+C in the Terminal running the GUI also stops the detached migration engine.
@@ -515,7 +515,7 @@ directory for its own process.
 - This prevents an invisible background migration from continuing after the GUI exits.
 
 
-## v0.19.3 — macOS packaging foundation
+## v0.19.6 — macOS packaging foundation
 
 CloudMover now has a first-class macOS application build path.
 
@@ -553,7 +553,7 @@ This build is intentionally unsigned and unnotarized. Code signing,
 notarization, DMG packaging, and Proton CLI provisioning are later packaging
 milestones.
 
-## v0.19.3 — live iCloud inventory correctness
+## v0.19.6 — live iCloud inventory correctness
 
 - The picker now overlays migration rows onto the current live iCloud directory tree.
 - Empty folders and folders with no currently tracked regular files are visible.
@@ -564,7 +564,7 @@ milestones.
 - Inventory is reconciled again immediately before Start/Resume.
 - `0 / 0 selected files` now renders as 0%, never 100%.
 
-## v0.19.3 — packaged migration worker
+## v0.19.6 — packaged migration worker
 
 - Fixed Start Migration inside `CloudMover.app`.
 - Development mode still launches the engine with
@@ -574,10 +574,36 @@ milestones.
 - The packaged migration engine therefore does not require an external Python
   interpreter and no longer receives the invalid `-m src.cloudmover.start` arguments.
 
-## v0.19.3 — CloudMover app icon
+## v0.19.6 — CloudMover app icon
 
 - Added the official orange/grey CloudMover application icon.
 - Added a 1024px PNG source asset.
 - Added a macOS `.icns` bundle icon.
 - PyInstaller now embeds the icon into `CloudMover.app`.
 - Finder and the Dock will use the branded CloudMover icon after rebuilding.
+
+## v0.19.6 — adaptive batching + recovery hardening
+
+- The 250 MB target remains the primary batch goal; the file-count safety ceiling
+  rises from 250 to 5,000 to avoid tiny ~10 MB batches on trees full of small files.
+- Stranded VERIFYING rows are explicitly regression-tested to recover to READY.
+- Proton list/verification commands now have a 600-second timeout and Proton
+  subprocesses inherit the worker process group so Pause/Close can interrupt them cleanly.
+- SIGTERM follows CloudMover's graceful KeyboardInterrupt cleanup path.
+- GUI Pause/Close signals the worker process group.
+- Hydration and verification report determinate 0–100% activity progress through SQLite.
+  Proton CLI 0.8.x upload remains indeterminate because it exposes no byte progress.
+
+## v0.19.6 — authoritative pause/resume state machine
+
+- A migration is shown as Running only when its worker PID is actually alive.
+- Stale RUNNING database state is automatically repaired to PAUSED when no worker exists.
+- HYDRATING rows recover to PENDING; UPLOADING and VERIFYING rows recover to READY.
+  COMPLETE rows are never changed.
+- Resume order is now: recover stale runtime state → reconcile iCloud inventory while
+  paused → launch worker → worker claims PID → mark migration RUNNING.
+- The same recovery runs in the worker itself, so direct/packaged resumes are safe.
+- Stale PID files are removed automatically.
+- Proton CLI children inherit the worker process group, so GUI Pause/Close reaches
+  worker and Proton together; internal timeouts still terminate the child directly.
+- Paused UI no longer displays stale Verifying/Uploading activity as if work is active.
