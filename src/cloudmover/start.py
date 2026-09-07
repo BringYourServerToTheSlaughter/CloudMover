@@ -1,17 +1,19 @@
-
 from __future__ import annotations
+from .providers import proton
+from .disk_space import RESERVE_BYTES
 import argparse, json, os, shutil, signal, time
 from datetime import timedelta
 from pathlib import Path
 
 from .bulk_pipeline import run_bulk
 from .engine import migration_id, free_bytes
-from .release import release_specific, human_bytes
+from .release import release_specific, record_release_error, cleanup_warning_count, human_bytes
 from .state import connect, create_schema, get_latest_migration_id, utc_now, recover_stale_runtime_state
 from .ui import dashboard
 from .app_paths import default_db_path, default_log_path, ensure_app_support
 
-VERSION="0.19.5"
+from .version import VERSION
+from .diagnostics import safe_diagnostic
 
 def engine_pid_path(db:Path)->Path:
     return db.with_name(db.stem + ".engine.pid")
@@ -71,7 +73,8 @@ def eligible_releases(db:Path,limit:int=1000):
             """SELECT migration_id,relative_path FROM files
                WHERE migration_id=? AND selected=1
                  AND transfer_state='COMPLETE' AND verified=1
-                 AND COALESCE(local_released,0)=0
+                 AND COALESCE(local_released,0)=0 AND release_error IS NULL
+                 AND relative_path != '.DS_Store' AND substr(relative_path,-10) != '/.DS_Store'
                ORDER BY updated_at ASC LIMIT ?""",(mid,limit)
         ).fetchall()
         return [(str(r["migration_id"]),str(r["relative_path"])) for r in rows]
@@ -152,21 +155,25 @@ def choose_batch(free:int,reserve:int,user_batch:int)->int:
     if headroom < 5_000_000_000: return min(user_batch,10)
     return user_batch
 
-def log_event(log_path:Path,event:str,**data):
+def log_event(log_path:Path,event:str,*,migration_id:str,**data):
     log_path.parent.mkdir(parents=True,exist_ok=True)
-    rec={"ts":utc_now(),"event":event,**data}
+    rec={"ts":utc_now(),"event":event,"migration_id":migration_id,**data}
     with log_path.open("a",encoding="utf-8") as f:
         f.write(json.dumps(rec,ensure_ascii=False)+"\n")
 
 def drain_releases(db:Path,log_path:Path)->tuple[int,int]:
     released=reclaimed=0
-    for mid,rp in eligible_releases(db):
+    for mid,rp in eligible_releases(db,limit=2_147_483_647):
         try:
+            log_event(log_path,"release_start",migration_id=mid,relative_path=rp)
             _,n=release_specific(db,mid,rp)
             released+=1; reclaimed+=n
-            log_event(log_path,"release_complete",relative_path=rp,reclaimed_bytes=n)
+            log_event(log_path,"release_complete",migration_id=mid,relative_path=rp,reclaimed_bytes=n)
         except LookupError:
             continue
+        except Exception as exc:
+            record_release_error(db,mid,rp,exc)
+            log_event(log_path,"release_warning",migration_id=mid,relative_path=rp,error=safe_diagnostic(exc))
     return released,reclaimed
 
 def dry_run(db:Path,reserve:int,batch:int,target_mb:float):
@@ -194,6 +201,7 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
     recovered_startup=recover_stale_runtime_state(db)
     started=time.monotonic(); cycle=0
     baseline=snapshot(db)
+    mid=baseline["id"]
     baseline_files=baseline["complete_files"]
     baseline_bytes=baseline["complete_bytes"]
 
@@ -209,15 +217,16 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
             s=snapshot(db)
             print("\n"+progress_line(s,started,baseline_files,baseline_bytes))
             if s["complete_files"] >= s["total_files"]:
+                drain_releases(db,log_path)
                 set_migration_status(db,"COMPLETE")
-                log_event(log_path,"migration_complete",files=s["total_files"],bytes=s["total_bytes"])
+                log_event(log_path,"migration_complete",migration_id=mid,files=s["total_files"],bytes=s["total_bytes"],cleanup_warnings=cleanup_warning_count(db))
                 print("\nMigration COMPLETE.")
                 return
 
             if max_cycles is not None and cycle>=max_cycles:
                 normalize_transient_states_for_pause(db)
                 set_migration_status(db,"PAUSED")
-                log_event(log_path,"cycle_limit",cycles=cycle)
+                log_event(log_path,"cycle_limit",migration_id=mid,cycles=cycle)
                 print("\nCycle limit reached. Migration paused safely.")
                 return
 
@@ -225,7 +234,7 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
             if free <= reserve:
                 normalize_transient_states_for_pause(db)
                 set_migration_status(db,"PAUSED")
-                log_event(log_path,"reserve_stop",free_bytes=free,reserve_bytes=reserve)
+                log_event(log_path,"reserve_stop",migration_id=mid,free_bytes=free,reserve_bytes=reserve)
                 print("\nProtected disk reserve reached. Migration paused safely.")
                 return
 
@@ -237,37 +246,39 @@ def run(db:Path,batch:int,reserve:int,destination:str|None,max_cycles:int|None,
             chosen=choose_batch(free_bytes(db),reserve,batch)
             cycle+=1
             print(f"\n=== cycle {cycle} | batch up to {chosen} | free {human_bytes(free_bytes(db))} ===")
-            log_event(log_path,"cycle_start",cycle=cycle,batch=chosen)
+            log_event(log_path,"cycle_start",migration_id=mid,cycle=cycle,batch=chosen)
 
             try:
                 target_bytes=int(target_mb*1_000_000)
-                run_bulk(db,count=chosen,min_bytes=min_bytes,max_bytes=max_bytes,
-                         destination=destination,verify_workers=1,
-                         target_bytes=target_bytes,hydrate_workers=hydrate_workers,verbose=verbose)
+                with proton.observe_cli(lambda event,**data: log_event(log_path,event,migration_id=mid,**data)):
+                    run_bulk(db,count=chosen,min_bytes=min_bytes,max_bytes=max_bytes,
+                             destination=destination,verify_workers=1,
+                             target_bytes=target_bytes,hydrate_workers=hydrate_workers,verbose=verbose,reserve_bytes=reserve,
+                             event_callback=lambda event,**data: log_event(log_path,event,migration_id=mid,**data))
             except LookupError:
                 # No eligible PENDING/READY work: if everything isn't complete, surface state.
                 s=snapshot(db)
                 if s["complete_files"]>=s["total_files"]:
                     continue
                 set_migration_status(db,"PAUSED")
-                log_event(log_path,"no_eligible_work",states=s["states"])
+                log_event(log_path,"no_eligible_work",migration_id=mid,states=s["states"])
                 print("\nNo eligible READY/PENDING work remains for current size policy.")
                 print("Migration paused; inspect state before changing policy.")
                 return
 
             released,reclaimed=drain_releases(db,log_path)
             print(f"Released: {released} verified file(s), {human_bytes(reclaimed)} reclaimed")
-            log_event(log_path,"cycle_complete",cycle=cycle,released=released,reclaimed_bytes=reclaimed)
+            log_event(log_path,"cycle_complete",migration_id=mid,cycle=cycle,released=released,reclaimed_bytes=reclaimed)
     except KeyboardInterrupt:
         recovered=normalize_transient_states_for_pause(db)
         set_migration_status(db,"PAUSED")
-        log_event(log_path,"user_pause",cycle=cycle,recovered=recovered)
+        log_event(log_path,"user_pause",migration_id=mid,cycle=cycle,recovered=recovered)
         print("\nPaused safely. Run the same command to resume.")
         return
     except Exception as exc:
         recovered=normalize_transient_states_for_pause(db)
         set_migration_status(db,"PAUSED")
-        log_event(log_path,"error",cycle=cycle,error=str(exc),recovered=recovered)
+        log_event(log_path,"error",migration_id=mid,cycle=cycle,error=safe_diagnostic(exc),recovered=recovered)
         print(f"\nStopped safely: {exc}")
         raise SystemExit(1)
     finally:
@@ -277,7 +288,7 @@ def main():
     ap=argparse.ArgumentParser(description="CloudMover production-engine trial")
     ap.add_argument("--db",type=Path,default=None)
     ap.add_argument("--batch",type=int,default=5000)
-    ap.add_argument("--reserve-gb",type=float,default=20.0)
+    ap.add_argument("--reserve-gb",type=float,default=RESERVE_BYTES/1_000_000_000)
     ap.add_argument("--destination",default=None, help="optional safety assertion; must match destination stored in migration plan")
     ap.add_argument("--max-cycles",type=int,default=None)
     ap.add_argument("--target-mb",type=float,default=250.0)

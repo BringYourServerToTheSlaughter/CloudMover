@@ -1,5 +1,8 @@
 
 from __future__ import annotations
+from .disk_space import RESERVE_BYTES, require_batch_space
+from .version import VERSION
+from .destination import prepare_destination
 import argparse, os, shutil, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -213,7 +216,11 @@ def hydrate_selected_parallel(
 def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
              max_bytes:int=DEFAULT_MAX,destination:str=DEFAULT_DEST,timeout:float=300,
              verify_workers:int=DEFAULT_VERIFY_WORKERS,target_bytes:int|None=None,
-             hydrate_workers:int=1,verbose:bool=False):
+             hydrate_workers:int=1,verbose:bool=False,reserve_bytes:int=RESERVE_BYTES,event_callback=None):
+    def emit(event, **data):
+        if event_callback:
+            event_callback(event, **data)
+
     recovered=recover_incomplete(db)
     recovered_verify=recover_verifying(db)
 
@@ -232,6 +239,9 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
     if not items:
         raise LookupError("no READY or eligible cloud-only PENDING files for bulk trial")
 
+    base=prepare_destination(db,destination,items[0].migration_id)
+    require_batch_space(items, reserve_bytes)
+
     print(f"Recovered:   {recovered} interrupted hydration file(s)")
     print(f"Recovered:   {recovered_verify} interrupted verification file(s)")
     print(f"Batch size:  {len(items)}")
@@ -239,6 +249,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
     print(f"Payload:     {human_bytes(payload_bytes)}")
     print()
 
+    emit("hydration_start",files=len(items),logical_bytes=payload_bytes)
     timings={"hydrate":0.0,"stage":0.0,"upload":0.0,"verify":0.0}
     set_activity_progress(db,stage="hydrate",completed=0,total=len(items),detail="Preparing selected files")
     if hydrate_workers > 1:
@@ -264,19 +275,17 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
             hydrated.append(item)
             set_activity_progress(db,stage="hydrate",completed=len(hydrated),total=len(items),detail=item.relative_path)
 
+    emit("hydration_complete",files=len(hydrated))
     with tempfile.TemporaryDirectory(prefix="cloudmover-stage-") as td:
         stage=Path(td)
         t=perf_counter()
         top_paths=stage_batch(hydrated,stage)
         timings["stage"]=perf_counter()-t
 
-        # Ensure only the destination root once; folder hierarchy is sent in bulk.
-        parent,name=destination.rsplit("/",1)
-        base=proton.ensure_folder(parent or "/",name)
+        # The exact destination root was claimed before hydration.
         remote_cache={base}
         for item in hydrated:
-            _,remote_file=ensure_remote_tree(base,item.relative_path,remote_cache)
-            proton.assert_no_remote_file(remote_file)
+            ensure_remote_tree(base,item.relative_path,remote_cache)
 
         for item in hydrated:
             transition_file(db,item.migration_id,item.relative_path,
@@ -286,14 +295,40 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
             t=perf_counter()
             payload_detail=f"{payload_bytes/1024**2:,.1f} MB" if payload_bytes else ""
             set_activity_progress(db,stage="upload",completed=0,total=0,detail=f"{len(hydrated):,} files • {human_bytes(payload_bytes)}")
+            emit("upload_start",files=len(hydrated),logical_bytes=payload_bytes)
             with Activity("Uploading",payload_detail,enabled=not verbose):
-                for item in hydrated:
-                    parts=Path(item.relative_path).parts
-                    remote_parent=base.rstrip("/")
-                    if len(parts)>1:
-                        remote_parent += "/" + "/".join(parts[:-1])
-                    proton.safe_upload_promote(stage/item.relative_path,remote_parent,parts[-1])
+                entries=[]
+                indexed={}
+                for file_index,item in enumerate(hydrated,1):
+                    local=stage/item.relative_path
+                    parent=base.rstrip("/")
+                    if local.parent != stage:
+                        parent += "/" + str(Path(item.relative_path).parent)
+                    entries.append((local,parent,local.name))
+                    indexed[local]=(file_index,item)
+                completed=0
+                for remote_parent,files in proton.transport_groups(entries):
+                    def observe_file(local,event,**data):
+                        nonlocal completed
+                        file_index,item=indexed[local]
+                        if data.get("phase")=="safe_upload_total" and data.get("status")=="completed":
+                            completed+=1
+                        emit(event,relative_path=item.relative_path,logical_bytes=item.logical_bytes,**data)
+                        set_activity_progress(db,stage="upload",completed=completed,total=len(hydrated),
+                                              detail=item.relative_path,migration_id=item.migration_id,
+                                              relative_path=item.relative_path,logical_bytes=item.logical_bytes,
+                                              file_index=file_index,file_total=len(hydrated),
+                                              phase=data["phase"],phase_status=data["status"])
+                    def observe_group(event,**data):
+                        emit(event,files=len(files),**data)
+                        set_activity_progress(db,stage="upload",completed=completed,total=len(hydrated),
+                                              detail=f"{len(files)} files",migration_id=hydrated[0].migration_id,
+                                              relative_path="",file_index=0,file_total=len(hydrated),
+                                              phase=data["phase"],phase_status=data["status"])
+                    with proton.observe_safe_upload(observe_group):
+                        proton.safe_upload_group(files,remote_parent,observe_file=observe_file)
             timings["upload"]=perf_counter()-t
+            emit("upload_complete",files=len(hydrated),logical_bytes=payload_bytes,duration_ms=round(timings["upload"]*1000))
             set_activity_progress(db,stage="upload",completed=1,total=1,detail="Upload complete")
         except Exception as exc:
             for item in hydrated:
@@ -304,6 +339,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
                     pass
             raise
 
+        emit("verification_start",files=len(hydrated))
         for item in hydrated:
             transition_file(db,item.migration_id,item.relative_path,TransferState.VERIFYING)
 
@@ -352,6 +388,7 @@ def run_bulk(db:Path,count:int=DEFAULT_COUNT,min_bytes:int=DEFAULT_MIN,
                             TransferState.COMPLETE,verified=True)
             verified_count+=1
             print(f"[verify  {verified_count}/{len(items)}] COMPLETE {item.relative_path}")
+        emit("verification_complete",files=verified_count)
         timings["verify"]=perf_counter()-t
         set_activity_progress(db,stage="complete",completed=1,total=1,detail="Batch verified")
 
@@ -376,10 +413,10 @@ def main():
     ap.add_argument("--hydrate-workers",type=int,default=1)
     ap.add_argument("--verbose",action="store_true")
     a=ap.parse_args()
-    print("CloudMover 0.19.5\n")
+    print(f"CloudMover {VERSION}\n")
     print("Bulk end-to-end performance trial")
     print(f"Destination: {a.destination}")
-    print("Strategy:    hydrate batch -> hard-link tree -> ONE Proton upload -> exact verify\n")
+    print("Strategy:    hydrate batch -> hard-link tree -> bounded same-parent temp uploads -> exact verify\n")
     try:
         done=run_bulk(a.db,a.batch,a.min_bytes,a.max_bytes,a.destination,a.timeout,a.verify_workers,hydrate_workers=a.hydrate_workers,verbose=getattr(a,"verbose",False))
     except KeyboardInterrupt:

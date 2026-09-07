@@ -1,0 +1,90 @@
+{
+  "migration_id": "f4387f9d-508e-44bd-88c7-52e5b23cf24a",
+  "file_attempts": 13,
+  "logical_bytes_attempted": 50828655,
+  "upload_wall_seconds": 210.71,
+  "upload_cli_seconds": 27.753,
+  "temp_verification_seconds": 39.496,
+  "promote_seconds": 94.562,
+  "final_verification_seconds": 46.91299999999999,
+  "estimated_outside_stage_seconds": 1.9860000000000184,
+  "cli_process_count": 63,
+  "commands_per_file": 4.846153846153846,
+  "upload_commands_per_file": 4.153846153846154,
+  "commands_all_observed": {
+    "filesystem create-folder": {
+      "calls": 2,
+      "total_seconds": 5.961,
+      "average_seconds": 2.9805,
+      "percent_upload_wall": null
+    },
+    "filesystem info": {
+      "calls": 29,
+      "total_seconds": 92.953,
+      "average_seconds": 3.2052758620689654,
+      "percent_upload_wall": null
+    },
+    "filesystem list": {
+      "calls": 18,
+      "total_seconds": 57.083,
+      "average_seconds": 3.1712777777777776,
+      "percent_upload_wall": null
+    },
+    "filesystem rename": {
+      "calls": 13,
+      "total_seconds": 52.672,
+      "average_seconds": 4.051692307692307,
+      "percent_upload_wall": null
+    },
+    "filesystem upload": {
+      "calls": 1,
+      "total_seconds": 27.75,
+      "average_seconds": 27.75,
+      "percent_upload_wall": null
+    }
+  },
+  "commands_upload_pipeline": {
+    "filesystem info": {
+      "calls": 26,
+      "total_seconds": 86.213,
+      "average_seconds": 3.3158846153846153,
+      "percent_upload_wall": 40.91547624697451
+    },
+    "filesystem list": {
+      "calls": 14,
+      "total_seconds": 43.713,
+      "average_seconds": 3.122357142857143,
+      "percent_upload_wall": 20.745574486260736
+    },
+    "filesystem rename": {
+      "calls": 13,
+      "total_seconds": 52.672,
+      "average_seconds": 4.051692307692307,
+      "percent_upload_wall": 24.997389777419198
+    },
+    "filesystem upload": {
+      "calls": 1,
+      "total_seconds": 27.75,
+      "average_seconds": 27.75,
+      "percent_upload_wall": 13.169759384936642
+    }
+  },
+  "commands_batch_verification": {
+    "filesystem list": {
+      "calls": 1,
+      "total_seconds": 2.078,
+      "average_seconds": 2.078,
+      "percent_upload_wall": null
+    }
+  },
+  "upload_command_percent": 13.169759384936642,
+  "metadata_command_percent": 86.65844051065446,
+  "outside_cli_seconds": 0.36199999999999477,
+  "process_startup_seconds": null,
+  "api_only_seconds": null,
+  "average_cli_seconds": 3.75268253968254,
+  "cli_failures": 2,
+  "effective_logical_MB_per_second": 0.2412256418774619,
+  "average_successful_file_latency_seconds": 145.43615384615384,
+  "incomplete_upload": false
+}

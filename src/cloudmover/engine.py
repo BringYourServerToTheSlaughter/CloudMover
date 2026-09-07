@@ -1,5 +1,7 @@
 
 from __future__ import annotations
+from .disk_space import RESERVE_BYTES
+from .version import VERSION
 import argparse, shutil, time
 from pathlib import Path
 from .bulk_pipeline import run_bulk
@@ -13,7 +15,8 @@ def completed_unreleased(db:Path, migration_id:str) -> list[tuple[str,str]]:
         rows=c.execute(
             """SELECT migration_id,relative_path FROM files
                WHERE migration_id=? AND transfer_state='COMPLETE' AND verified=1
-                 AND COALESCE(local_released,0)=0
+                 AND COALESCE(local_released,0)=0 AND release_error IS NULL
+                 AND relative_path != '.DS_Store' AND substr(relative_path,-10) != '/.DS_Store'
                ORDER BY updated_at ASC""",(migration_id,)
         ).fetchall()
         return [(str(r["migration_id"]),str(r["relative_path"])) for r in rows]
@@ -48,7 +51,7 @@ def run_engine(db:Path,cycles:int,batch:int,min_bytes:int,max_bytes:int,
 
         before=set(completed_unreleased(db,mid))
         run_bulk(db,count=batch,min_bytes=min_bytes,max_bytes=max_bytes,
-                 destination=destination,verify_workers=verify_workers)
+                 destination=destination,verify_workers=verify_workers,reserve_bytes=reserve_bytes)
         after=completed_unreleased(db,mid)
 
         # Release only rows that are COMPLETE+verified. Include older eligible rows too:
@@ -62,6 +65,8 @@ def run_engine(db:Path,cycles:int,batch:int,min_bytes:int,max_bytes:int,
                 print(f"[release {released}] {rp} ({human_bytes(n)} reclaimed)")
             except LookupError:
                 continue
+            except Exception as exc:
+                print(f"Local cache cleanup warning: {exc}")
 
         print(f"Cycle {cycle}: released {released} verified file(s), reclaimed {human_bytes(reclaimed)}")
         print(f"Free disk:   {human_bytes(free_bytes(db))}")
@@ -74,10 +79,10 @@ def main():
     ap.add_argument("--min-bytes",type=int,default=100_000)
     ap.add_argument("--max-bytes",type=int,default=5_000_000)
     ap.add_argument("--destination",default="/my-files/CloudMover-Engine-Test")
-    ap.add_argument("--reserve-gb",type=float,default=20.0)
+    ap.add_argument("--reserve-gb",type=float,default=RESERVE_BYTES/1_000_000_000)
     ap.add_argument("--verify-workers",type=int,default=1)
     a=ap.parse_args()
-    print("CloudMover 0.19.5")
+    print(f"CloudMover {VERSION}")
     print("Rolling SMART_STAGING engine")
     print("Safety: verified Proton copy required before local iCloud cache release")
     try:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .version import VERSION
 
 import argparse
 import os
@@ -14,7 +15,7 @@ from typing import Callable, Iterator
 from .providers.icloud import HydrationState, inspect_file
 from .scanner import choose_strategy, human_bytes, walk_entries
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class TransferState(str, Enum):
@@ -131,6 +132,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE files ADD COLUMN source_sha256 TEXT")
     if "local_released" not in columns:
         conn.execute("ALTER TABLE files ADD COLUMN local_released INTEGER NOT NULL DEFAULT 0")
+    if "release_error" not in columns:
+        conn.execute("ALTER TABLE files ADD COLUMN release_error TEXT")
     if "released_at" not in columns:
         conn.execute("ALTER TABLE files ADD COLUMN released_at TEXT")
     if "selected" not in columns:
@@ -148,14 +151,24 @@ def initialize_migration(
     db_path: Path,
     destination: str | None = None,
     progress_callback: Callable[[dict], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> MigrationSummary:
+    def check_cancel():
+        if cancel_check and cancel_check():
+            raise RuntimeError("Scan cancelled")
+
+    check_cancel()
     source = source.expanduser().resolve()
+    check_cancel()
     if not source.exists():
         raise FileNotFoundError(f"source does not exist: {source}")
+    check_cancel()
     if not source.is_dir():
         raise NotADirectoryError(f"source is not a directory: {source}")
 
+    check_cancel()
     usage = os.statvfs(source)
+    check_cancel()
     free_bytes = usage.f_bavail * usage.f_frsize
 
     # Inventory in memory only at row granularity, then persist in batches. This avoids
@@ -165,11 +178,14 @@ def initialize_migration(
     files_seen = 0
     folders_seen = 0
     cloud_only_seen = 0
-    for entry in walk_entries(source):
+    for entry in walk_entries(source, checkpoint=check_cancel, strict=True):
+        check_cancel()
         try:
             path = Path(entry.path)
             relative = str(path.relative_to(source))
-            if entry.is_dir(follow_symlinks=False):
+            is_directory = entry.is_dir(follow_symlinks=False)
+            check_cancel()
+            if is_directory:
                 folders_seen += 1
                 if progress_callback:
                     progress_callback({
@@ -180,10 +196,15 @@ def initialize_migration(
                         "cloud_only": cloud_only_seen,
                     })
                 continue
-            if not entry.is_file(follow_symlinks=False):
+            check_cancel()
+            is_file = entry.is_file(follow_symlinks=False)
+            check_cancel()
+            if not is_file:
                 continue
             st = entry.stat(follow_symlinks=False)
+            check_cancel()
             state = inspect_file(entry.path, stat_result=st)
+            check_cancel()
             file_rows.append(
                 (
                     relative,
@@ -206,7 +227,7 @@ def initialize_migration(
                     "cloud_only": cloud_only_seen,
                 })
         except (PermissionError, FileNotFoundError, OSError) as exc:
-            print(f"warning: could not inventory {entry.path}: {exc}")
+            raise OSError(f"Could not inventory {entry.path}: {exc}") from exc
 
     if progress_callback:
         progress_callback({
@@ -218,6 +239,7 @@ def initialize_migration(
             "final": True,
         })
 
+    check_cancel()
     strategy, staging_bytes, reserve_bytes = choose_strategy(total_bytes, free_bytes)
     migration_id = str(uuid.uuid4())
     now = utc_now()
@@ -248,6 +270,11 @@ def initialize_migration(
                     now,
                 ),
             )
+            def persistent_rows():
+                for relative, path, logical, allocated, hydration in file_rows:
+                    check_cancel()
+                    yield (migration_id, relative, path, logical, allocated, hydration, now, now)
+
             conn.executemany(
                 """
                 INSERT INTO files(
@@ -256,11 +283,9 @@ def initialize_migration(
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
                 """,
-                [
-                    (migration_id, relative, path, logical, allocated, hydration, now, now)
-                    for relative, path, logical, allocated, hydration in file_rows
-                ],
+                persistent_rows(),
             )
+            check_cancel()
     finally:
         conn.close()
 
@@ -443,13 +468,14 @@ def recover_stale_runtime_state(db_path: Path) -> dict[str,int]:
         conn.close()
 
 
-def set_activity_progress(db_path: Path, *, stage: str, completed: int=0, total: int=0, detail: str="") -> None:
+def set_activity_progress(db_path: Path, *, stage: str, completed: int=0, total: int=0, detail: str="", **current_file) -> None:
     import json
     payload=json.dumps({
         "stage":str(stage),
         "completed":max(0,int(completed)),
         "total":max(0,int(total)),
         "detail":str(detail),
+        **current_file,
     })
     conn=connect(db_path)
     try:
@@ -476,6 +502,7 @@ def get_activity_progress(db_path: Path) -> dict:
         except Exception:
             return {"stage":"","completed":0,"total":0,"detail":""}
         return {
+            **{key:data[key] for key in ("migration_id","relative_path","logical_bytes","file_index","file_total","phase","phase_status") if key in data},
             "stage":str(data.get("stage","")),
             "completed":max(0,int(data.get("completed",0))),
             "total":max(0,int(data.get("total",0))),
@@ -560,7 +587,7 @@ def transition_file(
 
 
 def print_summary(summary: MigrationSummary, db_path: Path) -> None:
-    print("CloudMover 0.19.5")
+    print(f"CloudMover {VERSION}")
     print()
     print(f"Migration:  {summary.migration_id}")
     print(f"Database:   {db_path.expanduser()}")

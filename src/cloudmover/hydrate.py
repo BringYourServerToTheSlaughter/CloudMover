@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .version import VERSION
 
 import argparse
 import hashlib
@@ -385,7 +386,7 @@ def main() -> None:
     parser.add_argument("--min-bytes", type=int, default=None)
     args = parser.parse_args()
 
-    print("CloudMover 0.19.5")
+    print(f"CloudMover {VERSION}")
     print()
 
     if args.batch:

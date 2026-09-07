@@ -1,5 +1,7 @@
 
 from __future__ import annotations
+from .version import VERSION
+from .diagnostics import safe_diagnostic
 
 import argparse
 import shutil
@@ -33,6 +35,7 @@ def select_one(db: Path, migration_id: str | None = None) -> ReleaseItem:
               AND verified=1
               AND hydration_state='LOCAL'
               AND COALESCE(local_released,0)=0
+              AND relative_path != '.DS_Store' AND substr(relative_path,-10) != '/.DS_Store'
             ORDER BY allocated_bytes ASC, relative_path ASC
             LIMIT 1
             """,
@@ -66,6 +69,7 @@ def mark_released(db:Path,item:ReleaseItem,allocated_after:int)->None:
             SET hydration_state='CLOUD_ONLY',
                 allocated_bytes=?,
                 local_released=1,
+                release_error=NULL,
                 released_at=?,
                 updated_at=?
             WHERE migration_id=? AND relative_path=?
@@ -87,6 +91,7 @@ def get_specific_release_item(db: Path, migration_id: str, relative_path: str) -
             WHERE migration_id=? AND relative_path=?
               AND transfer_state='COMPLETE' AND verified=1
               AND COALESCE(local_released,0)=0
+              AND relative_path != '.DS_Store' AND substr(relative_path,-10) != '/.DS_Store'
             """,
             (migration_id, relative_path),
         ).fetchone()
@@ -99,7 +104,7 @@ def get_specific_release_item(db: Path, migration_id: str, relative_path: str) -
     finally:
         c.close()
 
-def release_specific(db: Path, migration_id: str, relative_path: str,
+def _release_specific(db: Path, migration_id: str, relative_path: str,
                      timeout: float=120, poll: float=1.0) -> tuple[ReleaseItem,int]:
     item=get_specific_release_item(db,migration_id,relative_path)
     path=Path(item.source_path)
@@ -122,27 +127,40 @@ def release_specific(db: Path, migration_id: str, relative_path: str,
         time.sleep(poll)
 
 
+def record_release_error(db, migration_id, relative_path, error):
+    c=connect(db)
+    try:
+        create_schema(c)
+        c.execute("UPDATE files SET release_error=? WHERE migration_id=? AND relative_path=? AND transfer_state='COMPLETE' AND verified=1 AND COALESCE(local_released,0)=0",
+                  (safe_diagnostic(error),migration_id,relative_path))
+        c.commit()
+    finally:
+        c.close()
+
+
+def release_specific(db, migration_id, relative_path, timeout=120, poll=1.0):
+    try:
+        return _release_specific(db,migration_id,relative_path,timeout,poll)
+    except LookupError:
+        raise
+    except Exception as exc:
+        record_release_error(db,migration_id,relative_path,exc)
+        raise
+
+
+def cleanup_warning_count(db):
+    c=connect(db)
+    try:
+        create_schema(c);mid=get_latest_migration_id(c)
+        return int(c.execute("SELECT COUNT(*) FROM files WHERE migration_id=? AND selected=1 AND transfer_state='COMPLETE' AND verified=1 AND release_error IS NOT NULL AND COALESCE(local_released,0)=0",(mid,)).fetchone()[0])
+    finally:
+        c.close()
+
+
 def release_one(db:Path,timeout:float=120,poll:float=1.0)->tuple[ReleaseItem,int]:
     item=select_one(db)
-    path=Path(item.source_path)
-    before=inspect_file(path)
-    if before.hydration is HydrationState.CLOUD_ONLY:
-        mark_released(db,item,before.allocated_bytes)
-        return item, max(0,item.allocated_bytes-before.allocated_bytes)
-    if before.hydration is not HydrationState.LOCAL:
-        raise RuntimeError(f"cannot safely release unknown hydration state: {path}")
+    return release_specific(db,item.migration_id,item.relative_path,timeout,poll)
 
-    request_evict(path)
-    deadline=time.monotonic()+timeout
-    while True:
-        after=inspect_file(path)
-        if after.hydration is HydrationState.CLOUD_ONLY:
-            reclaimed=max(0,before.allocated_bytes-after.allocated_bytes)
-            mark_released(db,item,after.allocated_bytes)
-            return item,reclaimed
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"timed out after {timeout:g}s waiting for iCloud eviction")
-        time.sleep(poll)
 
 def human_bytes(n:int)->str:
     v=float(n)
@@ -157,7 +175,7 @@ def main():
     ap.add_argument("--timeout",type=float,default=120)
     a=ap.parse_args()
 
-    print("CloudMover 0.19.5\n")
+    print(f"CloudMover {VERSION}\n")
     print("Single-file SMART_STAGING release trial")
     item=select_one(a.db)
     print(f"File:       {item.relative_path}")

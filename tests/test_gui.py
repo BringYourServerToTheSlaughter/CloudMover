@@ -19,7 +19,7 @@ def test_progress_is_selection_aware():
     s=Path("src/cloudmover/gui.py").read_text()
     assert "selected_files" in s
     assert "selected_bytes" in s
-    assert "/ {s[\"selected_files\"]:,} selected files" in s
+    assert "/ {s[\"selected_files\"]:,} files verified" in s
 
 def test_errors_are_first_class_and_actionable():
     s=Path("src/cloudmover/gui.py").read_text()
@@ -154,7 +154,7 @@ def test_setup_scan_dispatches_initialize_migration_off_gui_thread():
     assert "@Slot()" in s
     assert 'if not payload.get("final") and now-self.last_progress < 0.125:' in s
     assert "self.progress.emit(payload)" in s
-    assert "summary=initialize_migration(self.source,self.db_path,self.destination,report)" in s
+    assert "summary=initialize_migration(self.source,self.db_path,self.destination,report,cancel_check=self.cancel_event.is_set)" in s
     assert "self.finished.emit(summary,self.latest_progress)" in s
     assert "self.scan_thread=QThread(self)" in s
     assert "self.scan_worker.moveToThread(self.scan_thread)" in s
@@ -167,7 +167,7 @@ def test_setup_scan_disables_controls_and_prevents_duplicate_scan():
     assert "if self.scan_running():" in scan
     assert "return" in scan
     assert "self.next.setEnabled(False); self.back.setEnabled(False)" in scan
-    assert "Scanning iCloud Drive" in scan
+    assert "Scanning {source_label(self.source)}" in scan
     assert "self.scan_bar.setRange(0,0)" in scan
     assert "self.scan_bar.show()" in scan
     assert "self.scan_thread.start()" in scan
@@ -206,7 +206,7 @@ def test_setup_scan_shows_live_activity_without_known_percentage():
 
 def test_scan_complete_state_requires_review_migration_click():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert 'self.next.setText("Review Migration" if self.scan_summary else "Scan iCloud Drive")' in s
+    assert 'self.next.setText("Review Migration" if self.scan_summary else f"Scan {source_label(self.source)}")' in s
     scan=s[s.index("            if i==2:"):s.index("                self.next.setEnabled(False); self.back.setEnabled(False)")]
     assert "if self.scan_summary:" in scan
     assert "self.show_scan_review()" in scan

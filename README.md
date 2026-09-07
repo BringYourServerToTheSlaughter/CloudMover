@@ -270,7 +270,7 @@ The rolling-engine command is unchanged.
 Adds `src.cloudmover.start`, a continuous resume-first SMART_STAGING runner with:
 
 - continuous cycles until complete, paused, interrupted, or safety-stopped
-- 20 GB protected reserve by default
+- 5 GB protected reserve by default (plus batch hydration/staging headroom)
 - conservative adaptive batch count near the reserve
 - backlog release before new staging
 - overall file/data progress and ETA
@@ -306,7 +306,7 @@ Default policy:
 - up to 250 files
 - select 1 MB–100 MB files for the benchmark class
 - READY work still resumes first
-- 20 GB protected free-space reserve remains enforced
+- 5 GB protected free-space reserve remains enforced, with batch headroom checked before hydration
 - files >100 MB are intentionally excluded from this benchmark and will get a
   dedicated large-file lane after medium-file performance is measured
 
@@ -607,3 +607,119 @@ milestones.
 - Proton CLI children inherit the worker process group, so GUI Pause/Close reaches
   worker and Proton together; internal timeouts still terminate the child directly.
 - Paused UI no longer displays stale Verifying/Uploading activity as if work is active.
+
+### Active-state feedback and scan cancellation
+
+Welcome acknowledgement and scan navigation use both disabled controls and disabled
+button styling. During a scan, Cancel immediately switches to `Cancelling scan…`;
+Cancel, Back, and Scan remain unavailable until the worker exits. Cancellation is
+checked before and after directory enumeration and metadata inspection, and while
+persisting inventory rows. A cancelled inventory still rolls back its transaction.
+An individual synchronous macOS/iCloud filesystem call (such as directory enumeration,
+`stat`, or path resolution) cannot be interrupted by the cooperative cancellation
+flag. Cancellation waits for that call to return; CloudMover does not kill the worker.
+
+The dashboard derives its active stage from current file state and matching batch
+activity. Overall completed migration bytes remain separate from current-file
+hydration and current-batch progress. Verification counters describe folder groups,
+not files; upload activity remains indeterminate when Proton provides no total.
+`Finalizing migration…` does not mean complete: completion still follows the existing
+migration status criteria. Healthy runs show `Migration safety`; `Needs attention`
+is visible only when failed files exist.
+
+### Proton destination creation regression
+
+The installed Proton CLI contract is `filesystem create-folder parentPath name`.
+The parent must already exist; this is not recursive directory creation. Adding a
+readable migration-name folder above the UUID exposed a missing-parent bug: CloudMover
+attempted to create the UUID child without first creating its readable parent.
+The old log joined argv with spaces, making this look like argument splitting.
+Destination setup now ensures missing ancestors in order. Only an explicit Proton
+`Node not found:` error triggers creation; authentication/network errors propagate.
+Readable names and full UUID isolation remain unchanged.
+
+Audited CLI boundaries (all use subprocess argv arrays, never `shell=True`):
+
+| Operation | Positional arguments |
+| --- | --- |
+| create-folder | existing parent path, one complete folder name |
+| list / verification listing | one complete remote path (after list options) |
+| info / exact verification | one complete remote path; `-j` enables JSON |
+| temporary upload | local path(s), then one complete remote parent path |
+| rename / promotion | one complete temporary remote path, one complete final name |
+| trash cleanup | verified temporary node UID path |
+
+Spaces, apostrophes, parentheses, hyphens and Unicode stay within the original
+argument. Errors render argv as a JSON array so boundaries remain visible.
+All engine JSONL lifecycle and batch hydration/upload/verification/release events
+carry `migration_id`. The GUI incrementally reads scoped fatal errors (including
+older unscoped errors following a scoped start), displays a stopped/needs-attention
+state after the worker exits, and keeps raw CLI details behind Show error details.
+A new scoped start clears the previous run's error; other migrations' errors are
+never displayed as the current migration's failure.
+
+### Exact user-selected destinations (supersedes the earlier destination layout)
+
+New wizard migrations default to `/my-files/iCloud Migration - <date and time>`.
+The displayed destination is the actual transfer root: `Pics/file.jpg` goes directly
+under that folder. There is no implicit CloudMover parent or UUID directory.
+The editable destination can instead be `/my-files/My iCloud Backup` or another new
+folder in an existing parent. The source's relative hierarchy is preserved.
+
+Before scanning, read-only preflight refuses any existing destination, including an
+empty folder. Choose a different human-readable name after a collision; CloudMover
+never silently changes the chosen name or merges into an existing destination.
+The transfer path repeats preflight before creating the exact root. The created
+folder UID is stored with the migration ID in SQLite's existing metadata table,
+not as a remote directory or file. Resumes check that UID and the stored path.
+Existing per-file no-overwrite, verified promotion, and release checks remain in force.
+
+A crash after remote creation but before saving ownership fails closed: the folder
+is preserved and is not automatically adopted. Existing migration plans retain their
+original stored paths; an existing legacy root without an ownership record is also
+refused. Old verified test copies are not moved, renamed, or deleted by this change.
+The app never implicitly uses the user's `/my-files/CloudMover` build-storage folder.
+
+Creation response handling follows the Proton CLI's
+[create-folder implementation](https://github.com/ProtonDriveApps/sdk/blob/main/cli/src/commands/fileSystem/commandFileSystemCreateFolder.ts),
+which emits the created folder object with JSON output enabled.
+
+### Source-folder defaults, cleanup warnings, and upload diagnostics
+
+The default destination now preserves the selected source folder name. Selecting
+`SyncMeBro-2` displays and creates `/my-files/SyncMeBro-2`, with `Pics` and other
+relative children directly inside it. Selecting the iCloud Drive root uses the
+human-readable name `iCloud Drive`. Changing the source updates an automatic
+destination; a user-edited destination remains exactly as chosen. Existing-folder
+preflight, recorded destination ownership, no-clobber checks, and legacy paths are
+unchanged. No implicit timestamp, CloudMover, or UUID wrapper is added.
+
+New inventories exclude only the regular macOS metadata file `.DS_Store`, including
+nested occurrences. Other dotfiles remain eligible. Previously uploaded copies are
+not removed. Legacy `.DS_Store` rows are not eligible for cache release.
+
+Schema version 5 adds nullable `files.release_error`. A cleanup failure writes this
+field without changing COMPLETE, verified, or transfer `last_error`. The engine logs
+`release_warning`, continues with the remaining verified files, and reaches COMPLETE
+with a cleanup warning count. It does not repeatedly retry a recorded warning on
+every batch. A successful explicit release retry clears the warning. Disk reserve
+checks still pause safely if remaining local data leaves insufficient staging space.
+
+Overall progress now says `files verified`; selection counts are separate. Durable
+batch transfer/recovery states are unchanged. The existing activity JSON metadata
+additionally identifies the actual safe-upload file, its index/total, size, and phase,
+so the dashboard follows serial per-file activity rather than an arbitrary UPLOADING
+batch row. A file's safe-upload verification does not increment overall COMPLETE
+until the existing batch verification criteria pass. Byte progress remains unknown
+when Proton does not report it. Internet upload bandwidth, file sizes/counts, and
+provider/API overhead all affect duration; many small files incur more overhead.
+
+Bounded per-file `safe_upload_stage` JSONL events contain migration_id, relative_path,
+logical_bytes, phase, status, duration_ms, and exit_status where known. Phases are
+safe_upload_total, destination_preflight, cli_upload, temp_verification,
+rename_promote (including its immediate no-clobber preflight), and final_verification.
+Each phase produces one start and one terminal event, not a polling stream. Timing
+records contain no command output or credentials. Error diagnostics are bounded and
+redact common credential fields. CLI upload duration includes startup/auth/API and
+network work; these measurements locate expensive phases but cannot independently
+measure network bandwidth. No verification step was removed or shortened.

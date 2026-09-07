@@ -1,10 +1,12 @@
 
 from __future__ import annotations
+from .version import VERSION
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from .providers import proton
+from .destination import prepare_destination
 from .state import TransferState, connect, create_schema, get_latest_migration_id, transition_file, utc_now
 
 @dataclass(frozen=True)
@@ -72,13 +74,7 @@ def upload_specific(db: Path, migration_id: str, relative_path: str,
     if not local.exists(): raise FileNotFoundError(local)
     timings={}
     t=perf_counter()
-    parent,name=dest_parent.rsplit("/",1)
-    base_path=dest_parent.rstrip("/")
-    if remote_cache is not None and base_path in remote_cache:
-        base=base_path
-    else:
-        base = proton.ensure_folder(parent or "/",name)
-        if remote_cache is not None: remote_cache.add(base)
+    base=prepare_destination(db,dest_parent,migration_id)
     remote_parent, remote_file = ensure_remote_tree(base, item.relative_path, remote_cache)
     proton.assert_no_remote_file(remote_file)
     timings["path_setup"]=perf_counter()-t
@@ -103,8 +99,7 @@ def upload_specific(db: Path, migration_id: str, relative_path: str,
 def upload_one(db:Path,dest_parent:str="/my-files/CloudMover-Test")->Item:
     item=pick(db); local=Path(item.source_path)
     if not local.exists(): raise FileNotFoundError(local)
-    parent,name=dest_parent.rsplit("/",1)
-    base = proton.ensure_folder(parent or "/",name)
+    base=prepare_destination(db,dest_parent,item.migration_id)
     remote_parent, remote_file = ensure_remote_tree(base, item.relative_path)
     proton.assert_no_remote_file(remote_file)
     transition_file(db,item.migration_id,item.relative_path,TransferState.UPLOADING,increment_attempts=True)
@@ -126,7 +121,7 @@ def main():
     ap.add_argument("--db",type=Path,default=Path(".cloudmover/migration.db"))
     ap.add_argument("--destination",default="/my-files/CloudMover-Test")
     a=ap.parse_args()
-    print("CloudMover 0.19.5\n\nSingle-file Proton upload trial")
+    print(f"CloudMover {VERSION}\n\nSingle-file Proton upload trial")
     item=pick(a.db)
     print(f"File:        {item.relative_path}")
     print(f"Destination: {a.destination}")

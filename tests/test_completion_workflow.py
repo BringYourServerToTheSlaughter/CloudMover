@@ -51,7 +51,7 @@ def test_completion_screen_contains_required_summary_and_safety_text():
 
 def test_report_contains_core_safety_counts():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert "Files completed:" in s
-    assert "Files verified:" in s
-    assert "Files failed:" in s
-    assert "Originals remain in iCloud." in s
+    assert "successfully copied and verified" in s
+    assert "Verified files:" in s
+    assert "Failed files:" in s
+    assert "Originals remain safely in iCloud" in s

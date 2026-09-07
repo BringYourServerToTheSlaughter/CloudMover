@@ -4,6 +4,9 @@
 from pathlib import Path
 
 project_root = Path(SPECPATH)
+version_scope = {}
+exec((project_root / "src/cloudmover/version.py").read_text(), version_scope)
+VERSION = version_scope["VERSION"]
 
 a = Analysis(
     [str(project_root / "cloudmover_app.py")],
@@ -57,12 +60,12 @@ app = BUNDLE(
     name="CloudMover.app",
     icon=str(project_root / "assets" / "CloudMover.icns"),
     bundle_identifier="com.cloudmover.app",
-    version="0.19.6",
+    version=VERSION,
     info_plist={
         "CFBundleName": "CloudMover",
         "CFBundleDisplayName": "CloudMover",
-        "CFBundleShortVersionString": "0.19.6",
-        "CFBundleVersion": "0.19.6",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
     },

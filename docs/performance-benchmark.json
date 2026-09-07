@@ -1,0 +1,70 @@
+{
+  "simulation_only": true,
+  "delay_ms_per_command": 10.0,
+  "results": [
+    {
+      "mode": "original_per_file",
+      "concurrency": 1,
+      "files": 14,
+      "wall_seconds": 3.314,
+      "average_file_latency_seconds": 0.237,
+      "max_file_latency_seconds": 0.24,
+      "subprocess_count": 112,
+      "failures": 0,
+      "timeouts": 0,
+      "child_cpu_seconds": 1.674,
+      "parent_cpu_seconds": 0.138,
+      "cpu_percent_of_one_core": 54.7,
+      "simulated_provider_errors": 0,
+      "real_provider_errors": null
+    },
+    {
+      "mode": "original_per_file",
+      "concurrency": 2,
+      "files": 14,
+      "wall_seconds": 1.703,
+      "average_file_latency_seconds": 0.243,
+      "max_file_latency_seconds": 0.246,
+      "subprocess_count": 112,
+      "failures": 0,
+      "timeouts": 0,
+      "child_cpu_seconds": 1.716,
+      "parent_cpu_seconds": 0.136,
+      "cpu_percent_of_one_core": 108.8,
+      "simulated_provider_errors": 0,
+      "real_provider_errors": null
+    },
+    {
+      "mode": "original_per_file",
+      "concurrency": 3,
+      "files": 14,
+      "wall_seconds": 1.264,
+      "average_file_latency_seconds": 0.253,
+      "max_file_latency_seconds": 0.259,
+      "subprocess_count": 112,
+      "failures": 0,
+      "timeouts": 0,
+      "child_cpu_seconds": 1.799,
+      "parent_cpu_seconds": 0.141,
+      "cpu_percent_of_one_core": 153.6,
+      "simulated_provider_errors": 0,
+      "real_provider_errors": null
+    },
+    {
+      "mode": "grouped",
+      "concurrency": 1,
+      "files": 14,
+      "wall_seconds": 1.702,
+      "average_file_latency_seconds": 1.13,
+      "max_file_latency_seconds": 1.701,
+      "subprocess_count": 58,
+      "failures": 0,
+      "timeouts": 0,
+      "child_cpu_seconds": 0.862,
+      "parent_cpu_seconds": 0.072,
+      "cpu_percent_of_one_core": 54.9,
+      "simulated_provider_errors": 0,
+      "real_provider_errors": null
+    }
+  ]
+}

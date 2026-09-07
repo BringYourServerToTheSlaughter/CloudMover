@@ -30,14 +30,14 @@ def test_bulk_fresh_destination_marks_verified_complete(tmp_path, monkeypatch):
 
     calls={"uploaded":False,"checked":[]}
     from src.cloudmover.bulk_pipeline import proton
-    monkeypatch.setattr(proton,"ensure_folder",lambda parent,name: parent.rstrip("/")+"/"+name)
+    monkeypatch.setattr("src.cloudmover.bulk_pipeline.prepare_destination",lambda db,path,mid:path)
     monkeypatch.setattr(proton,"assert_no_remote_file",lambda path: calls["checked"].append(path))
     monkeypatch.setattr(proton,"safe_upload_promote",lambda local,parent,name: calls.__setitem__("uploaded",True))
     monkeypatch.setattr(proton,"verify_tree",lambda local,remote,rels: None)
 
     assert run_bulk(db,count=1,destination="/my-files/CloudMover/run")==1
     assert calls["uploaded"] is True
-    assert calls["checked"]==["/my-files/CloudMover/run/a.txt"]
+    assert calls["checked"]==[]  # provider owns preflight; no redundant engine lookup
     c=connect(db)
     row=c.execute("SELECT transfer_state,verified,destination_path FROM files").fetchone()
     c.close()
@@ -55,11 +55,11 @@ def test_bulk_collision_refuses_before_upload_or_complete(tmp_path, monkeypatch)
     c.commit(); c.close()
 
     from src.cloudmover.bulk_pipeline import proton
-    monkeypatch.setattr(proton,"ensure_folder",lambda parent,name: parent.rstrip("/")+"/"+name)
+    monkeypatch.setattr("src.cloudmover.bulk_pipeline.prepare_destination",lambda db,path,mid:path)
     def collision(_):
         raise RuntimeError("remote destination already contains this path")
     monkeypatch.setattr(proton,"assert_no_remote_file",collision)
-    monkeypatch.setattr(proton,"safe_upload_promote",lambda local,parent,name: pytest.fail("upload should not start"))
+    monkeypatch.setattr(proton,"safe_upload_promote",lambda local,parent,name: collision(parent+"/"+name))
 
     with pytest.raises(RuntimeError,match="already contains this path"):
         run_bulk(db,count=1,destination="/my-files/CloudMover/run")
@@ -88,7 +88,7 @@ def test_bulk_does_not_fallback_from_tree_integrity_failure(tmp_path, monkeypatc
     c.commit(); c.close()
 
     from src.cloudmover.bulk_pipeline import proton
-    monkeypatch.setattr(proton,"ensure_folder",lambda parent,name: parent.rstrip("/")+"/"+name)
+    monkeypatch.setattr("src.cloudmover.bulk_pipeline.prepare_destination",lambda db,path,mid:path)
     monkeypatch.setattr(proton,"assert_no_remote_file",lambda path: None)
     monkeypatch.setattr(proton,"safe_upload_promote",lambda local,parent,name: None)
     monkeypatch.setattr(proton,"verify_tree",lambda local,remote,rels: (_ for _ in ()).throw(RuntimeError(error)))
@@ -114,7 +114,7 @@ def test_bulk_falls_back_when_tree_listing_is_incomplete(tmp_path, monkeypatch):
 
     from src.cloudmover.bulk_pipeline import proton
     calls={"fallback":0}
-    monkeypatch.setattr(proton,"ensure_folder",lambda parent,name: parent.rstrip("/")+"/"+name)
+    monkeypatch.setattr("src.cloudmover.bulk_pipeline.prepare_destination",lambda db,path,mid:path)
     monkeypatch.setattr(proton,"assert_no_remote_file",lambda path: None)
     monkeypatch.setattr(proton,"safe_upload_promote",lambda local,parent,name: None)
     monkeypatch.setattr(proton,"verify_tree",lambda local,remote,rels: (_ for _ in ()).throw(proton.TreeVerificationUnavailable("missing")))

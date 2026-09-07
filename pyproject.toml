@@ -1,6 +1,6 @@
 [project]
 name = "cloudmover"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Safe, resumable cloud file migration engine"
 requires-python = ">=3.11"
 
@@ -10,3 +10,6 @@ testpaths = ["tests"]
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.7"]
+
+[tool.setuptools.dynamic]
+version = {attr = "src.cloudmover.version.VERSION"}

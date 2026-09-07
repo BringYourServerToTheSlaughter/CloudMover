@@ -4,7 +4,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "CloudMover 0.19.0 macOS build"
+VERSION=$(python3 -c "from src.cloudmover.version import VERSION; print(VERSION)")
+echo "CloudMover $VERSION macOS build"
 echo "Cleaning previous build..."
 rm -rf build dist
 

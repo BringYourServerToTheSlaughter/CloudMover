@@ -8,7 +8,7 @@ def test_first_run_is_icloud_to_proton_only():
     assert "Move from iCloud Drive to Proton Drive" in s
     assert "SetupDialog" in s
     assert "default_icloud_path" in s
-    assert 'self.destination=f"/my-files/CloudMover/{uuid.uuid4()}"' in s
+    assert 'self.destination=new_destination(self.source)' in s
 
 def test_first_run_checks_source_and_proton():
     s=Path("src/cloudmover/gui.py").read_text()
@@ -21,7 +21,7 @@ def test_first_run_checks_source_and_proton():
 
 def test_first_run_scans_and_creates_plan():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert "initialize_migration(self.source,self.db_path,self.destination,report)" in s
+    assert "initialize_migration(self.source,self.db_path,self.destination,report,cancel_check=self.cancel_event.is_set)" in s
     assert "Nothing transfers until you press Start Migration" in s
 
 def test_existing_migration_skips_wizard():
@@ -30,7 +30,7 @@ def test_existing_migration_skips_wizard():
 
 def test_first_run_destination_explains_collision_safety():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert "Using a dedicated CloudMover migration folder reduces collision risk" in s
+    assert "Existing destinations are refused" in s
 
 def test_proton_destination_validation():
     assert validate_proton_destination("/my-files/CloudMover/run")[0] is True

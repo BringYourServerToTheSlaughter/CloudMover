@@ -1,4 +1,6 @@
 from __future__ import annotations
+from .disk_space import RESERVE_BYTES, BATCH_BYTES
+from .version import VERSION
 
 import argparse
 import json
@@ -41,30 +43,49 @@ def human_bytes(value: int) -> str:
     return f"{size:.2f} PB"
 
 
-def walk_entries(root: Path) -> Iterable[os.DirEntry]:
+def walk_entries(root: Path, checkpoint=None, strict=False) -> Iterable[os.DirEntry]:
     stack = [root]
     while stack:
+        if checkpoint:
+            checkpoint()
         current = stack.pop()
         try:
             with os.scandir(current) as entries:
-                for entry in entries:
+                while True:
+                    # Check before asking the provider for another directory entry.
+                    if checkpoint:
+                        checkpoint()
+                    try:
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    if checkpoint:
+                        checkpoint()
+                    if entry.name == ".DS_Store" and entry.is_file(follow_symlinks=False):
+                        continue
                     yield entry
-                    if entry.is_dir(follow_symlinks=False):
+                    if checkpoint:
+                        checkpoint()
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                    if checkpoint:
+                        checkpoint()
+                    if is_directory:
                         stack.append(Path(entry.path))
         except (PermissionError, FileNotFoundError, OSError) as exc:
+            if strict:
+                raise
             print(f"warning: could not scan {current}: {exc}")
 
 
 def choose_strategy(total_bytes: int, free_bytes: int) -> tuple[str, int, int]:
-    # MVP heuristic. Later this will account for provider constraints, hydration state,
-    # transfer rate, safety margins, filesystem semantics, and user preferences.
-    reserve = max(20_000_000_000, int(free_bytes * 0.20))
+    # The engine stages bounded batches even when the whole source fits locally.
+    reserve = RESERVE_BYTES
     usable = max(0, free_bytes - reserve)
 
     if usable >= int(total_bytes * 1.10):
-        return "FULL_LOCAL_STAGING", total_bytes, reserve
+        return "FULL_LOCAL_STAGING", min(total_bytes, BATCH_BYTES), reserve
 
-    staging = min(usable, max(5_000_000_000, int(total_bytes * 0.20)))
+    staging = min(usable, BATCH_BYTES)
     return "SMART_STAGING", staging, reserve
 
 
@@ -133,7 +154,7 @@ def scan(source: Path) -> ScanResult:
 
 
 def print_report(result: ScanResult) -> None:
-    print("CloudMover 0.4")
+    print(f"CloudMover {VERSION}")
     print()
     print(f"Source:      {result.source}")
     print()
