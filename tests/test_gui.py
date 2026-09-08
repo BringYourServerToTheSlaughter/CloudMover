@@ -78,7 +78,7 @@ def test_selection_tree_live_scans_are_opt_in():
 
 def test_paused_migration_shows_separate_new_migration_action():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert 'self.new_btn=QPushButton("New Migration...")' in s
+    assert 'self.new_btn=QPushButton("New Migration")' in s
     assert "self.new_btn.clicked.connect(self.new_migration)" in s
     assert 'self.resume_btn.setText("Resume Migration" if migration_has_started(self.db_path) else "Start Migration")' in s
     assert "self.new_btn.setVisible(True)" in s
@@ -86,18 +86,18 @@ def test_paused_migration_shows_separate_new_migration_action():
 def test_completed_migration_has_stable_completion_state():
     s=Path("src/cloudmover/gui.py").read_text()
     assert "self.completion_title.show()" in s
-    assert "self.completion_detail.setText(self.completion_summary_text(s,m))" in s
-    assert 'self.resume_btn.setText("Completed")' in s
-    assert 'self.pause_btn.setText("View Report")' in s
+    assert "files copied and verified" in s
+    assert 'self.resume_btn.hide()' in s
+    assert 'self.pause_btn.setText("Done")' in s
     assert "self.new_btn.setEnabled(True)" in s
     assert "No further action is required" in s
 
 def test_new_migration_confirms_paused_history_is_preserved():
     s=Path("src/cloudmover/gui.py").read_text()
     block=s[s.index("        def new_migration"):s.index("        def _setup_finished")]
-    assert "QMessageBox.question" in block
-    assert "The existing paused migration will remain unchanged in history." in block
-    assert "The new migration will become the active migration." in block
+    assert "dialog=QMessageBox(self)" in block
+    assert "existing iCloud and Proton files untouched." in block
+    assert 'dialog.addButton("Start New Migration",QMessageBox.AcceptRole)' in block
     assert "self.setup_page=SetupDialog(self.db_path)" in block
     assert "DELETE FROM migrations" not in block
     assert "UPDATE migrations SET status='COMPLETE'" not in block

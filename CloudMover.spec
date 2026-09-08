@@ -12,7 +12,8 @@ a = Analysis(
     [str(project_root / "cloudmover_app.py")],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[],
+    datas=[(str(project_root / "assets" / "CloudMover.png"), "assets"),
+           (str(project_root / "assets" / "Pingstate.png"), "assets")],
     hiddenimports=[
         "PySide6.QtCore",
         "PySide6.QtGui",

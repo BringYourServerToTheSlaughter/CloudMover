@@ -140,7 +140,7 @@ def test_consent_scan_refresh_cancel_and_retry(qt_classes,tmp_path,monkeypatch):
 
 def test_version_sources():
     import tomllib
-    assert VERSION=='0.19.6'
+    assert VERSION=='0.20.0'
     data=tomllib.loads(Path('pyproject.toml').read_text())
     assert data['tool']['setuptools']['dynamic']['version']['attr']=='src.cloudmover.version.VERSION'
     assert 'version=VERSION' in Path('CloudMover.spec').read_text()
@@ -154,14 +154,14 @@ def test_disabled_buttons_render_disabled(qt_classes,tmp_path):
         app.processEvents()
         return button.grab().toImage().pixelColor(15,button.height()//2).name()
     assert not w.next.isEnabled()
-    assert background(w.next)=='#183047'
+    assert background(w.next)=='#303030'
     w.consent.setChecked(True)
-    assert w.next.isEnabled() and background(w.next)=='#2563eb'
+    assert w.next.isEnabled() and background(w.next)=='#c2410c'
     w.consent.setChecked(False)
-    assert not w.next.isEnabled() and background(w.next)=='#183047'
+    assert not w.next.isEnabled() and background(w.next)=='#303030'
     w.pages.setCurrentIndex(2);w.refresh_page()
     w.back.setEnabled(False)
-    assert background(w.back)=='#183047'
+    assert background(w.back)=='#303030'
     w.close()
 
 
@@ -232,8 +232,8 @@ def test_dashboard_refresh_replaces_starting_and_matches_activity(dashboard_wind
     w,s=dashboard_window
     w.notice.setText('Starting migration…');w.refresh()
     assert not w.notice.text()
-    assert 'Hydrating file 1 of 6' in w.stage.text()
-    assert 'downloading from iCloud locally' in w.stage.text()
+    assert 'Downloading from iCloud — file 1 of 6' in w.stage.text()
+    assert 'downloading from iCloud locally' in w.fileprogress.text()
     assert w.bar.value()==0 and w.filebar.value()==500
     assert 'Overall migration progress' in w.status.text()
     assert 'Current file' in w.fileprogress.text()

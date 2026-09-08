@@ -132,7 +132,8 @@ def test_source_name_in_actual_window(qt_classes,tmp_path):
     db=tmp_path/'state.db';state.initialize_migration(source,db,'/my-files/SyncMeBro-2')
     window=scope['Window'](db)
     try:
-        assert window.route.text().startswith('SyncMeBro-2   →   Proton Drive')
+        assert window.route.text()=='SyncMeBro-2 → Proton Drive'
+        assert 'SyncMeBro-2' in window.destination_detail.toolTip()
         assert window.tree.topLevelItem(0).text(0)=='SyncMeBro-2'
         assert gui.source_label(gui.default_icloud_path())=='iCloud Drive'
         assert 'file 0' not in gui.current_upload_text({'phase':'cli_upload','detail':'14 files'})

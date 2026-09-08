@@ -154,7 +154,7 @@ def run_engine(db,log):
     start.run(db,10,5_000_000_000,None,1,log,1,100_000_000,250,1,True)
 
 
-@pytest.mark.parametrize("destination",[DESTINATION,"/my-files/SyncMeBro-2"])
+@pytest.mark.parametrize("destination",[DESTINATION,"/my-files/SyncMeBro-2","/my-files"])
 def test_disposable_file_hydrates_uploads_verifies_completes(remote,tmp_path,monkeypatch,destination):
     db,mid,local=planned(tmp_path,destination);log=tmp_path/'log.jsonl';downloaded=False;transitions=[]
     def inspect(path):

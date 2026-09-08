@@ -1,6 +1,8 @@
 from __future__ import annotations
 from .disk_space import RESERVE_BYTES, BATCH_BYTES
 import threading
+import json
+import logging
 import argparse, os, signal, subprocess, sys, shutil, time
 from datetime import datetime
 from pathlib import Path
@@ -9,10 +11,21 @@ from .scanner import human_bytes, walk_entries
 from .state import connect, create_schema, initialize_migration, reconcile_migration_inventory, get_activity_progress, recover_stale_runtime_state
 from .providers.icloud import inspect_file, HydrationState
 from .app_paths import default_db_path, default_log_path, ensure_app_support
-from .destination import preflight_destination
+from .destination import preflight_destination, DestinationExistsError
 from .event_log import MigrationEventReader, friendly_engine_failure
 
 from .version import VERSION
+from .cli_discovery import find_proton_drive_cli
+
+def cloudmover_icon():
+    from PySide6.QtGui import QIcon
+    root=Path(sys._MEIPASS) if getattr(sys,"frozen",False) else Path(__file__).resolve().parents[2]
+    return QIcon(str(root / "assets" / "CloudMover.png"))
+
+def pingstate_logo():
+    from PySide6.QtGui import QPixmap
+    root=Path(sys._MEIPASS) if getattr(sys,"frozen",False) else Path(__file__).resolve().parents[2]
+    return QPixmap(str(root / "assets" / "Pingstate.png"))
 
 def snapshot(db_path: Path) -> dict:
     conn=connect(db_path)
@@ -235,6 +248,8 @@ def new_destination(source=None):
 
 
 def friendly_destination(path):
+    if path.rstrip("/")=="/my-files":
+        return "Proton Drive root"
     parts = path.strip("/").split("/")
     if parts and parts[0] == "my-files":
         parts[0] = "Proton Drive"
@@ -260,27 +275,15 @@ def icloud_readiness(source):
     return True, "iCloud Drive folder is available and readable. Apple account / iCloud service state could not be confirmed."
 
 
-def find_proton_drive_cli() -> str | None:
-    found=shutil.which("proton-drive")
-    if found:
-        return found
-    for candidate in (
-        "/usr/local/bin/proton-drive",
-        "/opt/homebrew/bin/proton-drive",
-    ):
-        path=Path(candidate)
-        if path.is_file() and os.access(path,os.X_OK):
-            return str(path)
-    return None
-
 def validate_proton_destination(path: str) -> tuple[bool, str]:
     path=(path or "").strip()
     if not path:
         return False,"Enter a Proton destination."
+    if path in ("/my-files", "/my-files/"):
+        return True,"Files will be placed in Proton Drive. Existing files will not be overwritten."
     if not path.startswith("/my-files/"):
         return False,"Destination must start with /my-files/."
-    if path.rstrip("/") == "/my-files":
-        return False,"Choose a folder inside /my-files, not /my-files itself."
+
     if path.endswith("/"):
         return False,"Remove the trailing slash from the destination."
     parts=path.split("/")
@@ -321,8 +324,8 @@ def active_stage_text(snapshot):
     completed = int(activity.get("completed", 0))
     if state == "HYDRATING":
         if activity.get("stage") == expected and total > 0 and 0 <= completed < total:
-            return f"Hydrating file {completed + 1:,} of {total:,} — downloading from iCloud locally for transfer…"
-        return "Hydrating — downloading from iCloud locally for transfer…"
+            return f"Downloading from iCloud — file {completed + 1:,} of {total:,}…"
+        return "Downloading from iCloud…"
     if state == "UPLOADING" and activity.get("stage")=="upload" and activity.get("phase"):
         return current_upload_text(activity)
     if state == "UPLOADING":
@@ -334,11 +337,11 @@ def active_stage_text(snapshot):
 
 def main():
     try:
-        from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+        from PySide6.QtCore import QObject, QThread, QTimer, QSignalBlocker, Qt, Signal, Slot
         from PySide6.QtWidgets import (
             QApplication,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QProgressBar,
             QFrame,QPushButton,QTreeWidget,QTreeWidgetItem,QSplitter,QLineEdit,
-            QDialog,QStackedWidget,QFileDialog,QMessageBox,QCheckBox,QSizePolicy
+            QDialog,QStackedWidget,QFileDialog,QMessageBox,QCheckBox,QSizePolicy,QScrollArea,QLayout
         )
     except ImportError:
         raise SystemExit("CloudMover GUI requires PySide6. Install with: python3 -m pip install PySide6")
@@ -374,9 +377,6 @@ def main():
                     self.progress.emit(payload)
                 if self.cancel_event.is_set():
                     raise RuntimeError("Scan cancelled")
-                preflight_destination(self.destination)
-                if self.cancel_event.is_set():
-                    raise RuntimeError("Scan cancelled")
                 summary=initialize_migration(self.source,self.db_path,self.destination,report,cancel_check=self.cancel_event.is_set)
                 self.finished.emit(summary,self.latest_progress)
             except Exception as exc:
@@ -390,6 +390,8 @@ def main():
             self.source=default_icloud_path()
             self.destination=new_destination(self.source)
             self.destination_custom=False
+            self.destination_error=""
+            self._checking_destination=False
             self.scan_thread=None
             self.scan_worker=None
             self.scan_summary=None
@@ -397,26 +399,29 @@ def main():
             self.resize(760,640)
             self.setMinimumSize(680,600)
             self.setStyleSheet("""
-              QDialog,QWidget { background:#0b1c31; color:#f3f4f6; font-size:14px; }
+              QDialog,QWidget { background:#181818; color:#f3f4f6; font-size:14px; }
               QLabel { background:transparent; }
+              QProgressBar::chunk { background:#c2410c; }
               QCheckBox::indicator { width:20px; height:20px; border:1px solid #94a3b8; border-radius:3px; }
-              QCheckBox::indicator:checked { background:#2563eb; }
+              QCheckBox::indicator:checked { background:#c2410c; }
               QLabel#hero { font-size:28px; font-weight:700; color:#f8fafc; }
               QLabel#step { font-size:20px; font-weight:650; color:#f8fafc; }
-              QLabel#muted { color:#cbd5e1; }
+              QLabel#muted { color:#d4d4d4; }
               QLabel#sourceTitle { font-size:16px; font-weight:700; color:#f8fafc; }
               QLabel#sourceChanged { color:#fde68a; font-weight:650; }
               QPushButton { border-radius:8px; padding:10px 18px; font-weight:700;
-                            color:#f8fafc; background:#17324c; border:1px solid #47617b; }
-              QPushButton#primaryButton { color:white; background:#2563eb; border:1px solid #60a5fa; }
-              QPushButton#secondaryButton { color:#e5edf6; background:#12273d; border:1px solid #3d536b; }
+                            color:#f8fafc; background:#333333; border:1px solid #525252; }
+              QPushButton#primaryButton { color:white; background:#c2410c; border:1px solid #fb923c; }
+              QPushButton#secondaryButton { color:#e5edf6; background:#292929; border:1px solid #525252; }
               QPushButton:disabled, QPushButton#primaryButton:disabled, QPushButton#secondaryButton:disabled,
-              QPushButton#resumeButton:disabled, QPushButton#pauseButton:disabled, QPushButton#newMigrationButton:disabled { color:#8190a5; background:#183047; border:1px solid #334a60; }
-              QFrame#card { background:#10283f; border:1px solid #334a60; border-radius:10px; }
-              QLineEdit { background:#10283f; border:1px solid #405269; border-radius:8px;
+              QPushButton#resumeButton:disabled, QPushButton#pauseButton:disabled, QPushButton#newMigrationButton:disabled { color:#a3a3a3; background:#303030; border:1px solid #484848; }
+              QFrame#card { background:#242424; border:1px solid #484848; border-radius:10px; }
+              QLineEdit { background:#242424; border:1px solid #525252; border-radius:8px;
                           padding:9px 12px; color:#f8fafc; }
             """)
             lay=QVBoxLayout(self); lay.setContentsMargins(36,30,36,30); lay.setSpacing(14)
+            self.steps=QLabel('<b style="color:#fb923c">1 · Setup</b>  →  <span style="color:#a3a3a3">2 · Select  →  3 · Review  →  4 · Move  →  5 · Complete</span>')
+            self.steps.setWordWrap(True); lay.addWidget(self.steps)
             self.pages=QStackedWidget(); lay.addWidget(self.pages,1)
 
             # Welcome
@@ -436,25 +441,27 @@ def main():
             l.addStretch(); self.pages.addWidget(p)
 
             # System check
-            p=QWidget(); l=QVBoxLayout(p)
-            t=QLabel("System check"); t.setObjectName("step"); l.addWidget(t)
+            p=QWidget(); l=QVBoxLayout(p); l.setAlignment(Qt.AlignTop)
+            t=QLabel("Source & Destination"); t.setObjectName("step"); l.addWidget(t)
             system_layout=l
             source_card=QFrame(); source_card.setObjectName("card"); system_layout.addWidget(source_card)
             l=QVBoxLayout(source_card)
+            l.addWidget(QLabel("FROM · iCloud Drive"))
             self.source_title=QLabel(); self.source_title.setObjectName("sourceTitle"); self.source_title.setWordWrap(True); l.addWidget(self.source_title)
             self.source_path=QLabel(); self.source_path.setObjectName("muted"); self.source_path.setWordWrap(True); l.addWidget(self.source_path)
             self.source_note=QLabel(); self.source_note.setObjectName("sourceChanged"); self.source_note.setWordWrap(True); l.addWidget(self.source_note)
-            self.check_text=QLabel(); self.check_text.setMinimumHeight(175); self.check_text.setObjectName("muted"); self.check_text.setWordWrap(True); l.addWidget(self.check_text)
+            self.check_text=QLabel(); self.check_text.setMinimumHeight(110); self.check_text.setObjectName("muted"); self.check_text.setWordWrap(True); l.addWidget(self.check_text)
             choose=QPushButton("Choose a Different iCloud Folder"); choose.setObjectName("secondaryButton"); choose.clicked.connect(self.choose_source); l.addWidget(choose)
             destination_card=QFrame(); destination_card.setObjectName("card"); system_layout.addWidget(destination_card)
             l=QVBoxLayout(destination_card)
-            dest_label=QLabel("Proton destination"); dest_label.setObjectName("muted"); l.addWidget(dest_label)
+            dest_label=QLabel("TO · Proton Drive"); dest_label.setObjectName("muted"); l.addWidget(dest_label)
             self.dest_name=QLabel(friendly_destination(self.destination)); self.dest_name.setWordWrap(True); l.addWidget(self.dest_name)
             self.dest_edit=QLineEdit(self.destination)
             self.dest_edit.setPlaceholderText("/my-files/My iCloud Backup")
             self.dest_edit.textChanged.connect(self.destination_changed)
             l.addWidget(self.dest_edit)
             self.dest_help=QLabel(); self.dest_help.setObjectName("muted"); self.dest_help.setWordWrap(True); l.addWidget(self.dest_help)
+            self.dest_help.setTextFormat(Qt.PlainText)
             self.dest_edit.setStyleSheet("font-size:11px; color:#94a3b8")
             self.pages.addWidget(p)
 
@@ -495,6 +502,7 @@ def main():
             chosen=QFileDialog.getExistingDirectory(self,"Choose iCloud Drive",str(self.source))
             if chosen:
                 self.source=Path(chosen)
+                self.destination_error=""
                 if not self.destination_custom:
                     self.dest_edit.blockSignals(True)
                     self.destination=new_destination(self.source)
@@ -506,6 +514,7 @@ def main():
         def destination_changed(self,text):
             self.destination_custom=True
             self.destination=str(text).strip()
+            self.destination_error=""
             self.scan_summary=None
             if self.pages.currentIndex()==1:
                 self.refresh_page()
@@ -556,11 +565,10 @@ def main():
                     f"{'✓' if proton else '✕'} Proton Drive command-line service: {'available' if proton else 'not found'}\n\n"
                     f"{'✓' if space_ok else '✕'} Free disk space: {human_bytes(free)} free. Keep 5 GB free, plus up to 500 MB for a typical 250 MB batch. Larger files require more space."
                 )
-                self.check_text.setStyleSheet("background:#142c42; border-radius:8px; padding:12px; color:" + ("#cbd5e1" if source_ok and proton and space_ok else "#fda4af"))
+                self.check_text.setStyleSheet("background:#242424; border-radius:8px; padding:12px; color:" + ("#d4d4d4" if source_ok and proton and space_ok else "#fda4af"))
                 self.dest_name.setText(friendly_destination(self.destination))
-                self.dest_help.setText(
-                    f"{'✓' if destination_ok else '✕'} {destination_message}"
-                )
+                self.dest_help.setText(self.destination_error or f"{'✓' if destination_ok else '✕'} {destination_message}")
+                self.dest_help.setStyleSheet("color:#fda4af; padding:8px" if self.destination_error or not destination_ok else "color:#d4d4d4")
                 self.next.setText("Continue")
                 self.next.setEnabled(bool(source_ok and proton and destination_ok and space_ok))
             elif i==2:
@@ -590,21 +598,17 @@ def main():
 
         def go_next(self):
             i=self.pages.currentIndex()
-            if self.scan_running():
+            if self.scan_running() or self._checking_destination:
                 return
             if i==0 and not self.consent.isChecked():
                 return
-            if i in (1,2) and not self.scan_summary:
+            if i==1 or (i==2 and not self.scan_summary):
                 source_ok,proton,free=self.checks()
                 if not (source_ok and proton and free >= RESERVE_BYTES + 2*BATCH_BYTES):
                     self.pages.setCurrentIndex(1); self.refresh_page(); return
+                if not self.check_destination_before_scan():
+                    return
             if i<2:
-                if i==1:
-                    ok,msg=validate_proton_destination(self.destination)
-                    if not ok:
-                        QMessageBox.warning(self,"Check Proton destination",msg)
-                        self.refresh_page()
-                        return
                 self.pages.setCurrentIndex(i+1); self.refresh_page(); return
             if i==2:
                 if self.scan_running():
@@ -639,6 +643,40 @@ def main():
                 self.scan_thread.start()
                 return
             self.accept()
+
+        def check_destination_before_scan(self):
+            """Setup owns remote preflight; inventory failures cannot originate here.
+
+            Recheck on the Scan action too: the ready screen may have stayed open
+            while another actor created the destination. Never cache absence.
+            """
+            self._checking_destination=True
+            self.next.setEnabled(False); self.back.setEnabled(False)
+            self.next.setText("Checking Proton destination…")
+            self.next.repaint()
+            try:
+                valid,message=validate_proton_destination(self.destination)
+                if not valid:
+                    raise ValueError(message)
+                preflight_destination(self.destination)
+                self.destination_error=""
+                return True
+            except Exception as exc:
+                if isinstance(exc,DestinationExistsError):
+                    self.destination_error=(f"That Proton folder already exists\n\n{exc.path}\n\n"
+                        "CloudMover won't merge into or overwrite an existing folder. Choose a different destination name to continue.")
+                else:
+                    reason=getattr(exc,'stderr',str(exc))
+                    self.destination_error=(f"Could not validate the Proton destination\n\n{self.destination}\n\n"
+                                            f"{reason[:400]}\nCheck the destination and Proton connection, then try again.")
+                self.scan_summary=None
+                self.pages.setCurrentIndex(1)
+                self.refresh_page()
+                self.dest_edit.setFocus(); self.dest_edit.selectAll()
+                return False
+            finally:
+                self._checking_destination=False
+                self.refresh_page()
 
         def reject(self):
             if self.scan_running():
@@ -731,7 +769,7 @@ def main():
         def scan_failed(self,message):
             self.finish_scan_thread()
             self.scan_summary=None
-            self.scan_text.setText("Scan cancelled. You can scan again." if message == "Scan cancelled" else "Scan failed. Check the source and try again.")
+            self.scan_text.setText("Scan cancelled. You can scan again." if message == "Scan cancelled" else "Scan failed. The inventory could not be completed. Try scanning again.")
             self.scan_thread=None
             self.scan_worker=None
             self.scan_bar.hide()
@@ -747,13 +785,13 @@ def main():
             self.setWindowTitle(content['title'])
             self.setMinimumWidth(520)
             self.setStyleSheet("""
-                QDialog { background:#0b1c31; color:#f3f4f6; }
+                QDialog { background:#181818; color:#f3f4f6; }
                 QLabel { color:#e2e8f0; font-size:15px; background:transparent; }
                 QLabel#completionHeading { color:#f8fafc; font-size:26px; font-weight:700; }
                 QLabel#completionIcon { font-size:32px; font-weight:700; }
-                QLabel#completionDestination { background:#142c42; border-radius:8px; padding:14px; }
-                QLabel#completionCaption { color:#cbd5e1; font-size:13px; }
-                QPushButton { background:#2563eb; color:white; border:0; border-radius:7px; padding:10px 28px; font-size:15px; }
+                QLabel#completionDestination { background:#242424; border-radius:8px; padding:14px; }
+                QLabel#completionCaption { color:#d4d4d4; font-size:13px; }
+                QPushButton { background:#c2410c; color:white; border:0; border-radius:7px; padding:10px 28px; font-size:15px; }
                 QPushButton:hover { background:#1d4ed8; }
                 QPushButton:focus { border:2px solid #bfdbfe; }
             """)
@@ -784,51 +822,89 @@ def main():
             self.engine_events=MigrationEventReader(default_log_path())
             self.engine_failure_details=""
             self._selection_loading=False
+            self.reviewing=False
+            self._selection_handling=False
+            self._tree_generation=0
+            self._selection_migration_id=None
+            self._tree_reload_request=None
+            self._tree_check_states={}
+            self._selection_timer=QTimer(self)
+            self._selection_timer.setSingleShot(True)
+            self._selection_timer.timeout.connect(self.reconcile_tree_selection)
             self.setWindowTitle(f"CloudMover {VERSION}")
-            self.resize(1260,930)
-            self.setMinimumSize(1000,760)
+            self.setWindowIcon(cloudmover_icon())
+            self.resize(1040,820)
+            self.setMinimumSize(1000,600)
             self.setStyleSheet("""
-              QWidget { background:#0b1c31; color:#f3f4f6; font-size:14px; }
+              QWidget { background:#181818; color:#f3f4f6; font-size:14px; }
               QLabel#title { color:#f8fafc; font-size:30px; font-weight:700; }
-              QLabel#route { color:#cbd5e1; font-size:16px; }
+              QLabel#route { color:#d4d4d4; font-size:16px; }
               QLabel#status { color:#f1f5f9; font-size:20px; font-weight:600; }
               QLabel#completionTitle { color:#bbf7d0; font-size:24px; font-weight:800; }
               QLabel#completionDetail { color:#e2e8f0; line-height:150%; }
-              QLabel#muted { color:#cbd5e1; }
-              QLabel#safety { color:#dbeafe; }
-              QProgressBar { height:18px; border:0; border-radius:9px; background:#405269; }
-              QProgressBar::chunk { border-radius:9px; background:#22d3a6; }
-              QFrame { color:#52657b; }
+              QLabel#muted { color:#d4d4d4; }
+              QLabel#safety { color:#bbf7d0; }
+              QProgressBar { height:18px; border:0; border-radius:9px; background:#525252; }
+              QProgressBar::chunk { border-radius:9px; background:#c2410c; }
+              QFrame { color:#e2e8f0; }
+              QFrame#card { background:#242424; border:1px solid #484848; border-radius:12px; }
+              QLabel { background:transparent; }
               QPushButton { border-radius:8px; padding:10px 18px; font-weight:700; color:white; }
-              QPushButton#resumeButton { background:#0f9f7f; border:1px solid #22d3a6; }
-              QPushButton#resumeButton:hover { background:#10b98f; }
-              QPushButton#newMigrationButton { background:#0f9f7f; border:1px solid #22d3a6; }
-              QPushButton#newMigrationButton:hover { background:#10b98f; }
-              QPushButton#pauseButton { background:#b76518; border:1px solid #f59e0b; }
-              QPushButton#pauseButton:hover { background:#d1781e; }
+              QPushButton#resumeButton { background:#c2410c; border:1px solid #fb923c; }
+              QPushButton#resumeButton:hover { background:#ea580c; }
+              QPushButton#newMigrationButton { background:#404040; border:1px solid #737373; }
+              QPushButton#newMigrationButton:hover { background:#525252; }
+              QPushButton#pauseButton { background:#404040; border:1px solid #737373; }
+              QPushButton#pauseButton:hover { background:#525252; }
               QPushButton:disabled, QPushButton#primaryButton:disabled, QPushButton#secondaryButton:disabled,
-              QPushButton#resumeButton:disabled, QPushButton#pauseButton:disabled, QPushButton#newMigrationButton:disabled { color:#8190a5; background:#183047; border:1px solid #334a60; }
-              QTreeWidget { background:#0f2741; alternate-background-color:#102c49;
-                            border:1px solid #405269; border-radius:8px; padding:6px; }
+              QPushButton#resumeButton:disabled, QPushButton#pauseButton:disabled, QPushButton#newMigrationButton:disabled { color:#a3a3a3; background:#303030; border:1px solid #484848; }
+              QTreeWidget { background:#202020; alternate-background-color:#292929;
+                            border:1px solid #525252; border-radius:8px; padding:6px; }
               QTreeWidget::item { padding:4px; }
-              QTreeWidget::item:selected { background:#17496c; }
-              QLineEdit { background:#10283f; border:1px solid #405269; border-radius:8px;
+              QTreeWidget::item:selected { background:#713f12; }
+              QLineEdit { background:#242424; border:1px solid #525252; border-radius:8px;
                           padding:9px 12px; color:#f8fafc; }
-              QLineEdit:focus { border:1px solid #22d3a6; }
+              QLineEdit:focus { border:1px solid #fb923c; }
             """)
 
             root_layout=QVBoxLayout(self); root_layout.setContentsMargins(0,0,0,0)
             self.root_stack=QStackedWidget()
             root_layout.addWidget(self.root_stack)
+            self.creator_branding=QWidget(self)
+            creator=QHBoxLayout(self.creator_branding); creator.setContentsMargins(0,0,0,0); creator.setSpacing(7)
+            by=QLabel("Built by"); by.setObjectName("muted"); by.setStyleSheet("font-size:11px")
+            creator.addWidget(by,0,Qt.AlignVCenter)
+            self.creator_logo=QLabel(); self.creator_logo.setToolTip("Pingstate")
+            self.creator_logo.setAccessibleName("Pingstate")
+            logo=pingstate_logo().scaled(212,48,Qt.KeepAspectRatio,Qt.SmoothTransformation)
+            logo.setDevicePixelRatio(2)
+            self.creator_logo.setPixmap(logo)
+            creator.addWidget(self.creator_logo,0,Qt.AlignVCenter)
+            self.creator_branding.adjustSize()
 
             # Main migration page
             main_page=QWidget()
             lay=QVBoxLayout(main_page); lay.setContentsMargins(34,28,34,28); lay.setSpacing(10)
-            title=QLabel("CloudMover"); title.setObjectName("title"); lay.addWidget(title)
-            self.route=QLabel("Source   →   Proton Drive"); self.route.setObjectName("route"); lay.addWidget(self.route)
+            branding=QHBoxLayout(); branding.setSpacing(10)
+            self.brand_icon=QLabel(); self.brand_icon.setFixedSize(32,32)
+            self.brand_icon.setPixmap(cloudmover_icon().pixmap(64,64).scaled(32,32,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+            branding.addWidget(self.brand_icon,0,Qt.AlignVCenter)
+            title=QLabel("CloudMover"); title.setObjectName("title"); branding.addWidget(title)
+            branding.addStretch(); lay.addLayout(branding)
+            self.route=QLabel("iCloud Drive → Proton Drive"); self.route.setObjectName("route"); lay.addWidget(self.route)
+            self.destination_detail=QLabel(); self.destination_detail.setObjectName("muted"); lay.addWidget(self.destination_detail)
+            self.steps=QLabel(); self.steps.setWordWrap(True); lay.addWidget(self.steps)
+            page_layout=lay
+            body=QWidget()
+            self.main_scroll=QScrollArea(); self.main_scroll.setWidgetResizable(True)
+            self.main_scroll.setFrameShape(QFrame.NoFrame)
+            self.main_scroll.setWidget(body)
+            page_layout.addWidget(self.main_scroll,1)
+            lay=QVBoxLayout(body); lay.setContentsMargins(0,0,0,0); lay.setSpacing(10)
 
             # 1) Picker first
-            picker=QWidget(); pl=QVBoxLayout(picker); pl.setContentsMargins(0,12,0,0)
+            picker=QFrame(); picker.setObjectName("card"); self.picker=picker
+            pl=QVBoxLayout(picker); pl.setContentsMargins(18,16,18,16)
             pick_head=QHBoxLayout()
             pick_title=QLabel("Choose what to move"); pick_title.setObjectName("status")
             self.pick_summary=QLabel(""); self.pick_summary.setObjectName("muted")
@@ -855,17 +931,22 @@ def main():
             self.tree.setHeaderLabels(["File / Folder","Size","Status"])
             self.tree.setColumnWidth(0,560); self.tree.setColumnWidth(1,110)
             self.tree.itemChanged.connect(self.selection_changed)
-            pl.addWidget(self.tree)
+            self.tree.setMinimumHeight(320)
+            pl.addWidget(self.tree,1)
+            self.review_btn=QPushButton("Review Selection →"); self.review_btn.setObjectName("resumeButton")
+            self.review_btn.clicked.connect(self.review_selection); pl.addWidget(self.review_btn)
             lay.addWidget(picker,1)
 
             # 2) Migration status second
-            sep=QFrame(); sep.setFrameShape(QFrame.HLine); lay.addWidget(sep)
+            self.progress_card=QFrame(); self.progress_card.setObjectName("card"); lay.addWidget(self.progress_card)
+            main_layout=lay
+            lay=QVBoxLayout(self.progress_card); lay.setContentsMargins(18,16,18,16)
             self.status=QLabel("Migration"); self.status.setObjectName("status"); lay.addWidget(self.status)
             self.bar=QProgressBar(); self.bar.setRange(0,10000); self.bar.setTextVisible(False); lay.addWidget(self.bar)
             self.overall=QLabel(); self.overall.setObjectName("muted"); lay.addWidget(self.overall)
+            self.review_detail=QLabel(); self.review_detail.setWordWrap(True); self.review_detail.setTextFormat(Qt.PlainText); lay.addWidget(self.review_detail)
 
-            speed=QLabel("Migration speed depends on your internet connection, especially upload speed, file size, file count, and provider/API overhead. Many small files may take longer than fewer large files of the same total size.")
-            speed.setWordWrap(True); speed.setObjectName("muted"); lay.addWidget(speed)
+            self.phases=QLabel("Prepare → Upload → Verify → Release"); self.phases.setObjectName("muted"); lay.addWidget(self.phases)
             self.cleanup_notice=QLabel(); self.cleanup_notice.setWordWrap(True); self.cleanup_notice.setStyleSheet("color:#fde68a"); self.cleanup_notice.hide(); lay.addWidget(self.cleanup_notice)
             self.stage=QLabel(); self.stage.setObjectName("status"); lay.addWidget(self.stage)
             self.current=QLabel(); self.current.setWordWrap(True); self.current.setObjectName("muted"); lay.addWidget(self.current)
@@ -877,24 +958,44 @@ def main():
             self.attention_title=QLabel("Needs attention"); self.attention_title.setObjectName("status"); lay.addWidget(self.attention_title)
             self.attention=QLabel(); self.attention.setObjectName("muted"); self.attention.setWordWrap(True); lay.addWidget(self.attention)
 
-            safety_title=QLabel("Migration safety"); safety_title.setObjectName("status"); lay.addWidget(safety_title)
+            lay=main_layout
+            self.safety_toggle=QPushButton("Safety details"); self.safety_toggle.setCheckable(True)
+            self.safety_toggle.toggled.connect(lambda checked:self.safety_details.setVisible(checked))
+            lay.addWidget(self.safety_toggle)
+            self.safety_details=QLabel("Originals stay in iCloud. CloudMover verifies each Proton Drive copy before freeing temporary local storage. CloudMover keeps a protected disk reserve and refuses to overwrite existing Proton files.\n\nMigration speed depends on your internet connection, especially upload speed, file size, file count, and provider/API overhead. Many small files may take longer than fewer large files of the same total size.")
+            self.safety_details.setWordWrap(True); self.safety_details.hide(); lay.addWidget(self.safety_details)
             self.error_details=QPushButton("Show error details"); self.error_details.hide(); self.error_details.clicked.connect(self.show_engine_error); lay.addWidget(self.error_details)
             self.safety=QLabel(); self.safety.setObjectName("safety"); self.safety.setWordWrap(True); lay.addWidget(self.safety)
 
             # 3) Controls last
             controls=QHBoxLayout()
             self.resume_btn=QPushButton("Start Migration"); self.resume_btn.setObjectName("resumeButton")
-            self.pause_btn=QPushButton("Paused"); self.pause_btn.setObjectName("pauseButton")
-            self.new_btn=QPushButton("New Migration..."); self.new_btn.setObjectName("newMigrationButton")
+            self.pause_btn=QPushButton("Back"); self.pause_btn.setObjectName("pauseButton")
+            self.new_btn=QPushButton("New Migration"); self.new_btn.setObjectName("newMigrationButton")
             self.resume_btn.clicked.connect(self.primary_action)
             self.pause_btn.clicked.connect(self.secondary_action)
             self.new_btn.clicked.connect(self.new_migration)
             controls.addWidget(self.resume_btn); controls.addWidget(self.pause_btn); controls.addWidget(self.new_btn); controls.addStretch()
-            lay.addLayout(controls)
-            self.notice=QLabel(""); self.notice.setObjectName("muted"); self.notice.setWordWrap(True); lay.addWidget(self.notice)
+            self.export_log_btn=QPushButton("Export Log…")
+            self.export_log_btn.setObjectName("pauseButton")
+            self.export_log_btn.setToolTip("Save a copy of the diagnostic log. It may contain filenames and paths.")
+            self.export_log_btn.clicked.connect(self.export_log)
+            controls.addWidget(self.export_log_btn)
+            page_layout.addLayout(controls)
+            self.notice=QLabel(""); self.notice.setObjectName("muted"); self.notice.setWordWrap(True); page_layout.addWidget(self.notice)
 
-            self.foot=QLabel("Migration controls  •  refreshes every second"); self.foot.setObjectName("muted"); lay.addWidget(self.foot)
+            self.foot=QLabel(""); self.foot.setObjectName("muted"); lay.addWidget(self.foot)
+            self.review_spacer=QWidget(); lay.addWidget(self.review_spacer,1)
+            self.review_spacer.hide()
+            # Let wrapped status/details grow vertically instead of squeezing labels.
+            body.layout().setSizeConstraint(QLayout.SetMinimumSize)
+            self.reflow_labels=(self.status,self.overall,self.stage,self.current,self.fileprogress,
+                                self.attention,self.completion_detail,self.review_detail,self.safety_details)
+            for label in self.reflow_labels:
+                label.setSizePolicy(QSizePolicy.Preferred,QSizePolicy.Minimum)
+            self.progress_card.setSizePolicy(QSizePolicy.Preferred,QSizePolicy.Minimum)
             self.root_stack.addWidget(main_page)
+            self.safety_toggle.toggled.connect(lambda _:QTimer.singleShot(0,self.reflow_details))
 
             # Setup page lives inside the same window.
             self.setup_page=SetupDialog(self.db_path)
@@ -986,6 +1087,22 @@ def main():
             except OSError:
                 pass
 
+        def reflow_details(self):
+            for label in self.reflow_labels:
+                if not label.isHidden():
+                    label.setMinimumHeight(max(label.minimumSizeHint().height(),label.heightForWidth(label.width())))
+            self.progress_card.layout().activate()
+            self.main_scroll.widget().layout().activate()
+
+        def resizeEvent(self,event):
+            super().resizeEvent(event)
+            if hasattr(self,"creator_branding"):
+                self.creator_branding.move(self.width()-self.creator_branding.width()-34,
+                                         34)
+                self.creator_branding.raise_()
+            if hasattr(self,"reflow_labels"):
+                QTimer.singleShot(0,self.reflow_details)
+
         def closeEvent(self,event):
             if self.setup_page.scan_running():
                 self.setup_page.request_scan_cancel(); event.ignore(); return
@@ -1012,9 +1129,26 @@ def main():
             except Exception:
                 status=""
             if status=="COMPLETE":
-                self.view_report()
-            else:
+                self.close()
+            elif self.live_engine_pid():
                 self.pause_migration()
+            elif migration_has_started(self.db_path):
+                return
+            elif self.reviewing:
+                self.reviewing=False; self.refresh()
+            else:
+                m=snapshot(self.db_path)["m"]
+                self.setup_page.source=Path(m["source"])
+                self.setup_page.dest_edit.setText(str(m["destination"]))
+                self.setup_page.consent.setChecked(True)
+                self.root_stack.setCurrentWidget(self.setup_page)
+                self.setup_page.pages.setCurrentIndex(1); self.setup_page.refresh_page()
+
+        def review_selection(self):
+            if self.live_engine_pid() or migration_has_started(self.db_path) or snapshot(self.db_path)["selected_files"]<=0:
+                return
+            self.reviewing=True
+            self.refresh()
 
         def new_migration(self):
             if self.live_engine_pid():
@@ -1025,15 +1159,16 @@ def main():
             except Exception:
                 status=""
             if status!="COMPLETE":
-                answer=QMessageBox.question(
-                    self,
-                    "Create New Migration",
-                    "The existing paused migration will remain unchanged in history.\n\n"
-                    "The new migration will become the active migration.",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if answer!=QMessageBox.Yes:
+                dialog=QMessageBox(self)
+                dialog.setWindowTitle("Start a new migration?")
+                dialog.setText("Start a new migration?")
+                dialog.setInformativeText("This migration is incomplete. Starting a new migration\nwill leave its existing iCloud and Proton files untouched.")
+                dialog.setIcon(QMessageBox.Question)
+                cancel=dialog.addButton("Cancel",QMessageBox.RejectRole)
+                start=dialog.addButton("Start New Migration",QMessageBox.AcceptRole)
+                dialog.setDefaultButton(cancel); dialog.setEscapeButton(cancel)
+                dialog.exec()
+                if dialog.clickedButton()!=start:
                     return
             # Recreate setup state in this same window.
             self.setup_page=SetupDialog(self.db_path)
@@ -1046,6 +1181,9 @@ def main():
             self.root_stack.setCurrentWidget(self.setup_page)
 
         def _setup_finished(self):
+            self.reviewing=False
+            self.safety_toggle.setChecked(False)
+            self.main_scroll.verticalScrollBar().setValue(0)
             self.root_stack.setCurrentIndex(0)
             self.notice.setText("✓ New migration created • choose what to move, then Start Migration.")
             self.load_selection_tree()
@@ -1059,13 +1197,33 @@ def main():
             except Exception as exc:
                 QMessageBox.warning(self,"Migration Report",str(exc))
 
+        def export_log(self):
+            source=default_log_path()
+            if not source.is_file():
+                self.notice.setText("No diagnostic log is available yet.")
+                return
+            target,_=QFileDialog.getSaveFileName(self,"Export Log",f"CloudMover-{VERSION}-log.jsonl","JSONL log (*.jsonl)")
+            if not target:
+                return
+            try:
+                shutil.copyfile(source,target)
+            except shutil.SameFileError:
+                self.notice.setText("Choose a different file. The original diagnostic log cannot be replaced.")
+            except OSError:
+                self.notice.setText("Could not export the log. Check that the selected folder is writable and has free space.")
+            else:
+                self.notice.setText("Log exported successfully. The copy may contain filenames and paths.")
+
         def set_control_state(self,status,engine_live):
             """Controls reflect the real live engine PID, not stale transition text."""
             running=bool(engine_live)
+            started=migration_has_started(self.db_path)
+            self.pause_btn.setVisible(running or status=="COMPLETE" or not started)
             if running:
-                self.resume_btn.setText("Running")
+                self.resume_btn.hide()
                 self.resume_btn.setEnabled(False)
                 self.pause_btn.setText("Pause Migration")
+                self.pause_btn.setObjectName("pauseButton")
                 self.pause_btn.setEnabled(True)
                 self.new_btn.setVisible(False)
                 self.new_btn.setEnabled(False)
@@ -1073,9 +1231,10 @@ def main():
                 if self.notice.text().startswith("Resuming"):
                     self.notice.setText("✓ Migration resumed safely • engine is running.")
             elif status=="COMPLETE":
-                self.resume_btn.setText("Completed")
+                self.resume_btn.hide()
                 self.resume_btn.setEnabled(False)
-                self.pause_btn.setText("View Report")
+                self.pause_btn.setText("Done")
+                self.pause_btn.setObjectName("resumeButton")
                 self.pause_btn.setEnabled(True)
                 self.new_btn.setVisible(True)
                 self.new_btn.setEnabled(True)
@@ -1085,13 +1244,17 @@ def main():
             else:
                 self.resume_btn.setText("Resume Migration" if migration_has_started(self.db_path) else "Start Migration")
                 self.resume_btn.setEnabled(True)
-                self.pause_btn.setText("Paused")
-                self.pause_btn.setEnabled(False)
-                self.new_btn.setVisible(True)
-                self.new_btn.setEnabled(True)
+                self.resume_btn.setVisible(self.reviewing or migration_has_started(self.db_path))
+                self.pause_btn.setText("Back to Selection" if self.reviewing else "Back")
+                self.pause_btn.setObjectName("pauseButton")
+                self.pause_btn.setEnabled(True)
+                self.new_btn.setVisible(False)
+                self.new_btn.setEnabled(False)
                 self.tree.setEnabled(True)
                 if self.notice.text().startswith("Pausing"):
-                    self.notice.setText("✓ Paused safely • selection is unlocked.")
+                    self.notice.setText("✓ Paused safely • ready to resume.")
+            self.pause_btn.style().unpolish(self.pause_btn)
+            self.pause_btn.style().polish(self.pause_btn)
 
         def pause_migration(self):
             pid=self.live_engine_pid()
@@ -1159,11 +1322,29 @@ def main():
                 self.notice.setText(f"Could not resume migration: {exc}")
 
         def load_selection_tree(self, reconcile_live=False, include_live_directories=False):
-            m,rows=selection_rows(self.db_path)
+            # A checkbox signal is emitted inside Qt's editor/mouse event. Never
+            # clear items on that stack, including calls made by another slot.
+            if self._selection_handling or self._selection_loading or self._selection_timer.isActive():
+                old=self._tree_reload_request or (False,False)
+                self._tree_reload_request=(old[0] or reconcile_live,old[1] or include_live_directories)
+                self.log_tree_selection("tree_refresh_deferred",programmatic=True)
+                self._selection_timer.start(0)
+                return
             self._selection_loading=True
+            try:
+                with QSignalBlocker(self.tree):
+                    self._populate_selection_tree(reconcile_live,include_live_directories)
+            finally:
+                self._selection_loading=False
+
+        def _populate_selection_tree(self,reconcile_live,include_live_directories):
+            m,rows=selection_rows(self.db_path)
+            self._tree_generation+=1
+            self._tree_check_states.clear()
+            self._selection_migration_id=m["id"] if m else None
             self.tree.clear()
             if not m:
-                self._selection_loading=False; return
+                return
 
             status=str(m["status"]).upper()
             if reconcile_live and status not in ("RUNNING","COMPLETE"):
@@ -1183,6 +1364,7 @@ def main():
 
             root_item=QTreeWidgetItem([source_label(m["source"]),human_bytes(index["bytes"]),""])
             root_item.setData(0,Qt.UserRole,"")
+            root_item.setData(0,Qt.UserRole+1,index["total"])
             root_item.setFlags(root_item.flags()|Qt.ItemIsUserCheckable)
             self.apply_check(root_item,index["selected"],index["total"])
             self.tree.addTopLevelItem(root_item)
@@ -1193,42 +1375,116 @@ def main():
                     folder_status="Folder" if child["total"] else "Empty Folder"
                     item=QTreeWidgetItem([name,human_bytes(child["bytes"]),folder_status])
                     item.setData(0,Qt.UserRole,path)
+                    item.setData(0,Qt.UserRole+1,child["total"])
                     item.setFlags(item.flags()|Qt.ItemIsUserCheckable)
                     self.apply_check(item,child["selected"],child["total"])
                     parent.addChild(item)
                     add_node(item,child,path)
                 for name,path,size,selected,state in sorted(node["files"],key=lambda x:x[0].lower()):
-                    item=QTreeWidgetItem([name,human_bytes(size),state.title()])
+                    label={"COMPLETE":"Verified", "HYDRATING":"Downloading", "READY":"Ready", "UPLOADING":"Uploading", "VERIFYING":"Verifying", "FAILED":"Needs attention"}.get(state,"Selected" if selected else "Not selected")
+                    item=QTreeWidgetItem([name,human_bytes(size),label])
                     item.setData(0,Qt.UserRole,path)
+                    item.setData(0,Qt.UserRole+1,1)
                     item.setFlags(item.flags()|Qt.ItemIsUserCheckable)
-                    item.setCheckState(0,Qt.Checked if selected else Qt.Unchecked)
+                    self.apply_check(item,int(selected),1)
                     if state=="COMPLETE":
                         item.setToolTip(0,"Already completed; remains part of migration history.")
                     parent.addChild(item)
 
             add_node(root_item,index,"")
             root_item.setExpanded(True)
-            self._selection_loading=False
 
         def apply_check(self,item,selected,total):
-            if total and selected==total: item.setCheckState(0,Qt.Checked)
-            elif selected==0: item.setCheckState(0,Qt.Unchecked)
-            else: item.setCheckState(0,Qt.PartiallyChecked)
+            state=Qt.Checked if total and selected==total else (Qt.Unchecked if selected==0 else Qt.PartiallyChecked)
+            item.setCheckState(0,state)
+            path=item.data(0,Qt.UserRole)
+            if path is not None:
+                self._tree_check_states[str(path)]=state
+
+        def log_tree_selection(self,event,**data):
+            record=dict(ts=datetime.now().astimezone().isoformat(),event=event,
+                        migration_id=self._selection_migration_id,tree_generation=self._tree_generation,**data)
+            try:
+                with self.db_path.with_suffix('.selection.jsonl').open('a',encoding='utf-8') as stream:
+                    stream.write(json.dumps(record,ensure_ascii=False)+'\n')
+            except OSError:
+                logging.getLogger(__name__).warning('Could not write tree selection diagnostics')
 
         def selection_changed(self,item,column):
-            if self._selection_loading or column!=0: return
+            if self._selection_loading or self._selection_handling or column!=0: return
             path=item.data(0,Qt.UserRole)
             if path is None: return
+            path=str(path)
             state=item.checkState(0)
-            if state==Qt.PartiallyChecked: return
+            if state==Qt.PartiallyChecked or self._tree_check_states.get(path)==state: return
+            # Copy values now; no item references escape this handler.
+            descendants=int(item.data(0,Qt.UserRole+1) or 0)
+            self._tree_check_states[path]=state
+            self._selection_handling=True
+            began=time.perf_counter()
+            self.log_tree_selection("tree_selection_change_start",path=path,requested_state=state.name,
+                                    descendant_count=descendants,programmatic=False)
+            changed=0
+            error=None
             try:
-                changed=set_selection_prefix(self.db_path,str(path),state==Qt.Checked)
+                changed=set_selection_prefix(self.db_path,path,state==Qt.Checked)
                 self.notice.setText(f"Selection updated • {changed:,} unfinished file(s) changed.")
-                self.load_selection_tree()
-                self.refresh()
             except Exception as exc:
-                self.notice.setText(str(exc))
-                self.load_selection_tree()
+                error=str(exc)
+                self.notice.setText(error)
+            finally:
+                self.log_tree_selection("tree_selection_change_complete",path=path,requested_state=state.name,
+                                        descendant_count=descendants,programmatic=False,changed=changed,error=error,
+                                        persistence_duration_ms=round((time.perf_counter()-began)*1000,3))
+                self._selection_handling=False
+                if not self._selection_timer.isActive():
+                    self.log_tree_selection("tree_selection_reconcile_deferred",programmatic=True)
+                self._selection_timer.start(0)
+
+        def reconcile_tree_selection(self):
+            if self._selection_handling or self._selection_loading:
+                self._selection_timer.start(0)
+                return
+            self._selection_timer.stop()
+            if self._tree_reload_request is not None:
+                options=self._tree_reload_request
+                self._tree_reload_request=None
+                self.log_tree_selection("tree_refresh_start",programmatic=True)
+                self.load_selection_tree(*options)
+                self.log_tree_selection("tree_refresh_complete",programmatic=True)
+                self.refresh()
+                return
+            began=time.perf_counter()
+            # Read persisted truth once, then update the existing widgets in place.
+            # COMPLETE rows remain selected exactly as the persistence rules require.
+            try:
+                _,rows=selection_rows(self.db_path)
+            except Exception as exc:
+                self.notice.setText(f"Could not refresh selection: {exc}")
+                self.log_tree_selection("tree_selection_reconcile_failed",programmatic=True,error=str(exc))
+                return
+            selected={str(r['relative_path']):int(r['selected']) for r in rows}
+            self._selection_loading=True
+            self.tree.setUpdatesEnabled(False)
+            try:
+                with QSignalBlocker(self.tree):
+                    def visit(item):
+                        if item.childCount():
+                            counts=[visit(item.child(i)) for i in range(item.childCount())]
+                            checked=sum(c[0] for c in counts); total=sum(c[1] for c in counts)
+                        else:
+                            path=str(item.data(0,Qt.UserRole))
+                            total=int(path in selected); checked=selected.get(path,0)
+                        self.apply_check(item,checked,total)
+                        return checked,total
+                    for i in range(self.tree.topLevelItemCount()):
+                        visit(self.tree.topLevelItem(i))
+            finally:
+                self.tree.setUpdatesEnabled(True)
+                self._selection_loading=False
+            self.log_tree_selection("tree_selection_reconcile_complete",programmatic=True,
+                                    duration_ms=round((time.perf_counter()-began)*1000,3))
+            self.refresh()
 
         def tree_expand_all(self):
             self.tree.expandAll()
@@ -1268,25 +1524,76 @@ def main():
             )
             return (
                 f"Source path: {m['source']}\n"
-                f"Proton destination: {destination}\n"
+                f"Proton destination: {friendly_destination(destination)}\n"
                 f"Total selected files: {s['selected_files']:,}\n"
                 f"Completed files: {int(s['done']['n']):,}\n"
                 f"Verified files: {s['verified_files']:,}\n"
                 f"Failed files: {s['failed_files']:,}\n"
                 f"Total logical bytes migrated: {human_bytes(completed_bytes)}\n"
                 f"{released_line}\n"
-                f"{released_count:,} / {s['verified_files']:,} local copies released • {int(s.get('cleanup_warnings',0)):,} local cleanup warnings\n"
+                f"{released_count:,} / {s['verified_files']:,} local cache files freed • {int(s.get('cleanup_warnings',0)):,} local cleanup warnings\n"
                 f"Migration start time: {m['created_at']}\n"
                 f"Completion time: {m['updated_at']}\n"
                 f"Elapsed duration: {elapsed_between(m['created_at'],m['updated_at'])}\n\n"
                 "Source files remain in iCloud. Verified Proton copies were required before local cache release."
             )
 
+        def update_stage_presentation(self,s,status,live):
+            started=migration_has_started(self.db_path)
+            self.progress_card.layout().setContentsMargins(18,24 if live or started else 16,18,24 if live or started else 16)
+            activity=s.get("activity") or {}
+            active=s.get("active")
+            phase={"HYDRATING":"Prepare", "UPLOADING":"Upload", "VERIFYING":"Verify"}.get(
+                str(active["transfer_state"]) if active else "", "Prepare")
+            if not active and activity.get("stage") in ("release","evict"):
+                phase="Release"
+            step=5 if status=="COMPLETE" else 4 if live or started else 3 if self.reviewing else 2
+            if getattr(self,"_presented_step",None)!=step:
+                self._presented_step=step
+                self.resize(self.width(),820 if step==2 else 720 if step==5 else 640)
+            names=["Setup","Select","Review","Move","Complete"]
+            self.steps.setText("  →  ".join(
+                f'<span style="color:{"#fb923c" if n==step else "#a3a3a3"}">{"<b>" if n==step else ""}{"✓" if n<step else n} · {name}{"</b>" if n==step else ""}</span>'
+                for n,name in enumerate(names,1)))
+            self.picker.setVisible(step==2)
+            self.review_btn.setVisible(not started and not live and status!="COMPLETE")
+            self.export_log_btn.setVisible(started or live or status=="COMPLETE" or bool(self.engine_failure_details) or s.get("failed_files",0)>0)
+            self.new_btn.setText("New Migration…" if status!="COMPLETE" else "New Migration")
+            self.new_btn.setVisible(not live and (started or status in ("PAUSED","STOPPED","ERROR","COMPLETE") or bool(self.engine_failure_details)))
+            self.new_btn.setEnabled(not live)
+            self.review_btn.setEnabled(s["selected_files"]>0)
+            self.progress_card.setVisible(step!=2 or bool(self.engine_failure_details))
+            self.review_spacer.setVisible(not self.picker.isVisible())
+            reviewing=not started and not live and self.reviewing and status!="COMPLETE"
+            self.review_detail.setVisible(reviewing)
+            self.review_detail.setText(f"FROM\n{source_label(s['m']['source'])}\n{s['m']['source']}\n\nTO\nProton Drive\n{friendly_destination(s['m']['destination'])}\n\n✓ Originals stay in iCloud\n✓ Proton copies are verified\n✓ Temporary local storage is freed only after verification")
+            self.bar.setVisible(started or live or status=="COMPLETE")
+            self.phases.setVisible(live or (started and status!="COMPLETE"))
+            self.phases.setText(f"Prepare → Upload → Verify → Release   •   {phase if live else 'Finished' if status=='COMPLETE' else 'Paused'}")
+            if not started and not live and status!="COMPLETE" and not self.engine_failure_details:
+                self.status.setText("Ready to move")
+                self.overall.setText(f'{s["selected_files"]:,} files · {human_bytes(s["selected_bytes"])}')
+                self.stage.hide(); self.current.hide()
+            else:
+                self.stage.show(); self.current.show()
+            if status=="COMPLETE":
+                self.stage.hide(); self.current.hide()
+            if live and phase=="Release":
+                self.stage.setText("Freeing temporary local storage")
+                self.current.setText(str(activity.get("detail", "")))
+                self.fileprogress.setText(f'{int(activity.get("completed",0)):,} of {int(activity.get("total",0)):,} local cache files processed')
+                count=int(activity.get("total",0))
+                if count>0:
+                    self.filebar.setRange(0,count); self.filebar.setValue(min(count,int(activity.get("completed",0))))
+            self.resume_btn.setEnabled(not live and status!="COMPLETE" and s["selected_files"]>0)
+
         def refresh(self):
             try:
                 s=snapshot(self.db_path); m=s["m"]; d=s["done"]; a=s["active"]
                 destination=str(m["destination"] or "")
-                self.route.setText(f"{source_label(m['source'])}   →   Proton Drive   ({friendly_destination(destination) if destination else 'destination not set'})")
+                self.route.setText(f"{source_label(m['source'])} → Proton Drive")
+                self.destination_detail.setText(friendly_destination(destination) if destination else "Destination not set")
+                self.destination_detail.setToolTip(f"Source: {m['source']}")
                 total=s["selected_bytes"]; done=int(d["b"])
                 pct=(done/total*100 if total else 0.0)
                 self.bar.setValue(round(max(0,min(100,pct))*100))
@@ -1317,10 +1624,14 @@ def main():
 
                 db_status=str(m["status"]).upper()
                 live=self.live_engine_pid() is not None
+                completion_mismatch=(db_status=="COMPLETE" and
+                    (int(d["n"])!=s["selected_files"] or s["verified_files"]!=s["selected_files"] or failed_files>0))
 
                 # Runtime truth wins over stale database text. A migration cannot be
                 # visibly RUNNING when there is no worker process.
                 status="RUNNING" if live else db_status
+                if completion_mismatch and not live:
+                    status="ERROR"
                 if not live and db_status=="RUNNING":
                     recovered=self.repair_stale_runtime_if_needed()
                     s=snapshot(self.db_path); m=s["m"]; d=s["done"]; a=s["active"]
@@ -1336,7 +1647,7 @@ def main():
                 elif status=="RUNNING":
                     self.pick_help.setText("Selection is locked while CloudMover is running.")
                 else:
-                    self.pick_help.setText("Available while paused. Completed transfers stay in the migration history.")
+                    self.pick_help.setText("Choose files and folders, then review your selection.")
 
                 if status!="RUNNING":
                     self.filebar.hide(); self.fileprogress.hide()
@@ -1356,7 +1667,14 @@ def main():
                             self.status.setText("Migration complete — some local space could not be released")
                             self.completion_title.setText("Migration completed with local cleanup warnings")
                             completion_notice=f"All transfers completed. {cleanup_warnings:,} local {'copy' if cleanup_warnings==1 else 'copies'} could not be released."
-                        self.completion_detail.setText(self.completion_summary_text(s,m))
+                        self.completion_detail.setText(
+                            f"✓ {s['verified_files']:,} files copied and verified\n"
+                            f"✓ {human_bytes(int(d['b']))} moved safely\n\n"
+                            f"Source: {source_label(m['source'])}\n{m['source']}\n\n"
+                            f"Proton destination: {friendly_destination(destination)}\n\n"
+                            f"Verified files: {s['verified_files']:,} · Failed files: {failed_files:,}\n"
+                            f"{int(s['released']['n']):,} / {s['verified_files']:,} local cache files freed\n"
+                            f"Local cleanup warnings: {cleanup_warnings:,}")
                         self.current.setText(
                             f"{s['selected_files']:,} selected files • "
                             f"{human_bytes(s['selected_bytes'])} • "
@@ -1370,12 +1688,12 @@ def main():
                         self.stage.setText("Paused / ready")
                         queued=int(s.get("active_count",0))
                         self.current.setText(
-                            "Choose what to move, then start the migration."
+                            ("Resume when you’re ready to continue." if migration_has_started(self.db_path) else "Choose what to move, then start the migration.")
                             if not queued else
                             f"{queued:,} interrupted file(s) are queued for safe retry when you resume."
                         )
                         if self.notice.text().startswith("Pausing"):
-                            self.notice.setText("✓ Paused safely • selection is unlocked.")
+                            self.notice.setText("✓ Paused safely • ready to resume.")
                 elif a:
                     self.completion_title.hide()
                     self.completion_detail.hide()
@@ -1434,7 +1752,8 @@ def main():
                     self.filebar.show(); self.filebar.setRange(0,0); self.fileprogress.show()
                     self.fileprogress.setText("Working…")
 
-                failure=self.engine_events.failure(m.get("id") if isinstance(m,dict) else m["id"])
+                failure=("The recorded completion does not match the verified file counts. Your source originals remain safe. Review this migration before continuing."
+                         if completion_mismatch else self.engine_events.failure(m.get("id") if isinstance(m,dict) else m["id"]))
                 stopped=bool(failure and not live and status!="COMPLETE")
                 self.error_details.setVisible(stopped)
                 if stopped:
@@ -1455,20 +1774,18 @@ def main():
                 if self.notice.text().startswith(("Starting", "Resuming", "✓ Migration resumed")):
                     self.notice.clear()
 
-                fs=os.statvfs(m["source"]); free=fs.f_bavail*fs.f_frsize
-                self.safety.setText(
-                    "✓ Verified Proton copy required before local release\n"
-                    "✓ Originals remain in iCloud\n"
-                    f"✓ {human_bytes(free)} free • {human_bytes(m['reserve_bytes'])} kept free\n"
-                    f"✓ {s['released']['n']:,} selected verified local copies released")
+                self.safety.setText("Your originals stay in iCloud. CloudMover verifies each Proton Drive copy before freeing temporary local storage.")
                 if status=="COMPLETE":
                     selection_state="completed migration history"
                 elif status=="RUNNING":
                     selection_state="locked while running"
                 else:
                     selection_state="editable"
-                self.foot.setText(
-                    f"Engine: {str(m['status']).title()}  •  Selection {selection_state}  •  refreshes every second")
+                self.foot.clear()
+                self.update_stage_presentation(s,status,live)
+                QTimer.singleShot(0,self.reflow_details)
+                if completion_mismatch:
+                    self.resume_btn.hide(); self.resume_btn.setEnabled(False)
             except Exception as exc:
                 self.stage.setText("Unable to read migration"); self.current.setText(str(exc))
 
@@ -1476,6 +1793,7 @@ def main():
     ap.add_argument("--db",default=None)
     args=ap.parse_args()
     app=QApplication([])
+    app.setWindowIcon(cloudmover_icon())
     ensure_app_support()
     db_path=Path(args.db).expanduser() if args.db else default_db_path()
     w=Window(db_path)

@@ -17,6 +17,6 @@ def test_normal_proton_run_is_interruptible_and_bounded():
 def test_gui_control_state_uses_live_pid():
     s=Path("src/cloudmover/gui.py").read_text()
     assert "running=bool(engine_live)" in s
-    assert 'self.resume_btn.setText("Running")' in s
+    assert 'self.resume_btn.hide()' in s
     assert 'self.pause_btn.setText("Pause Migration")' in s
     assert 'transition=self.notice.text()' not in s

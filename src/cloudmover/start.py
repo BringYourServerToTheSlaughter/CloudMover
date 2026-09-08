@@ -8,7 +8,7 @@ from pathlib import Path
 from .bulk_pipeline import run_bulk
 from .engine import migration_id, free_bytes
 from .release import release_specific, record_release_error, cleanup_warning_count, human_bytes
-from .state import connect, create_schema, get_latest_migration_id, utc_now, recover_stale_runtime_state
+from .state import connect, create_schema, get_latest_migration_id, utc_now, recover_stale_runtime_state, set_activity_progress
 from .ui import dashboard
 from .app_paths import default_db_path, default_log_path, ensure_app_support
 
@@ -163,7 +163,9 @@ def log_event(log_path:Path,event:str,*,migration_id:str,**data):
 
 def drain_releases(db:Path,log_path:Path)->tuple[int,int]:
     released=reclaimed=0
-    for mid,rp in eligible_releases(db,limit=2_147_483_647):
+    pending=eligible_releases(db,limit=2_147_483_647)
+    for index,(mid,rp) in enumerate(pending):
+        set_activity_progress(db,stage="release",completed=index,total=len(pending),detail=rp,migration_id=mid)
         try:
             log_event(log_path,"release_start",migration_id=mid,relative_path=rp)
             _,n=release_specific(db,mid,rp)

@@ -34,7 +34,7 @@ def test_first_run_destination_explains_collision_safety():
 
 def test_proton_destination_validation():
     assert validate_proton_destination("/my-files/CloudMover/run")[0] is True
-    assert validate_proton_destination("/my-files")[0] is False
+    assert validate_proton_destination("/my-files")[0] is True
     assert validate_proton_destination("/shared-with-me/CloudMover/run")[0] is False
     assert validate_proton_destination("/my-files/CloudMover/../run")[0] is False
     assert validate_proton_destination("/my-files/CloudMover//run")[0] is False

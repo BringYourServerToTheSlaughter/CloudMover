@@ -3,10 +3,10 @@ from pathlib import Path
 
 def test_complete_state_offers_new_migration_and_report():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert 'self.resume_btn.setText("Completed")' in s
+    assert 'self.resume_btn.hide()' in s
     assert "self.resume_btn.setEnabled(False)" in s
-    assert 'self.pause_btn.setText("View Report")' in s
-    assert 'self.new_btn=QPushButton("New Migration...")' in s
+    assert 'self.pause_btn.setText("Done")' in s
+    assert 'self.new_btn=QPushButton("New Migration")' in s
     assert "def new_migration" in s
     assert "def view_report" in s
 

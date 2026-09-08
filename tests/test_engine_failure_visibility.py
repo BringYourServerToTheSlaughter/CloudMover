@@ -25,7 +25,7 @@ def test_fatal_engine_error_is_visible_without_failed_files(dashboard_window,tmp
     log_event(path,'start',migration_id='migration-a')
     monkeypatch.setattr(type(w),'live_engine_pid',lambda self:123)
     w.refresh()
-    assert 'Hydrating' in w.stage.text()
+    assert 'Downloading from iCloud' in w.stage.text()
     assert w.attention_title.isHidden() and w.error_details.isHidden()
 
 

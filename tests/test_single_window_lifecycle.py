@@ -12,7 +12,9 @@ def test_new_migration_does_not_exec_modal_setup():
     start=s.index("def new_migration")
     end=s.index("def _setup_finished")
     block=s[start:end]
-    assert ".exec()" not in block
+    setup_block=block[block.index("# Recreate setup state"): ]
+    assert ".exec()" not in setup_block
+    assert "self.root_stack.setCurrentWidget(self.setup_page)" in setup_block
     assert "self.root_stack.setCurrentWidget(self.setup_page)" in block
 
 def test_main_layout_order_picker_then_status_then_controls():

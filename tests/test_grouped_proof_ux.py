@@ -137,9 +137,10 @@ def test_actual_selection_verification_and_scan_labels(qt_classes,tmp_path):
     w=scope['Window'](db)
     try:
         assert w.pick_summary.text().startswith('13 files selected')
-        assert w.overall.text().startswith('0 / 13 files verified')
+        assert w.overall.text().startswith('13 files ·')
         assert w.tree.topLevelItem(0).text(0)=='SyncMeBro-2'
-        assert w.route.text().startswith('SyncMeBro-2')
+        assert w.route.text()=='SyncMeBro-2 → Proton Drive'
+        assert 'SyncMeBro-2' in w.destination_detail.toolTip()
         c=state.connect(db);c.execute("UPDATE files SET transfer_state='COMPLETE',verified=1 WHERE rowid IN (SELECT rowid FROM files LIMIT 5)");c.commit();c.close();w.refresh()
         assert w.overall.text().startswith('5 / 13 files verified')
         assert w.pick_summary.text().startswith('13 files selected')

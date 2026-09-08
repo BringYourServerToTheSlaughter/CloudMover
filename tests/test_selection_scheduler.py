@@ -13,7 +13,7 @@ def test_state_schema_has_selected_flag():
 
 def test_gui_has_stateful_controls():
     s=Path("src/cloudmover/gui.py").read_text()
-    assert 'setText("Running")' in s
-    assert 'setText("Paused")' in s
+    assert 'self.resume_btn.hide()' in s
+    assert 'self.pause_btn.setText("Back to Selection" if self.reviewing else "Back")' in s
     assert 'setText("Pausing…")' in s
     assert 'setText("Resuming…")' in s

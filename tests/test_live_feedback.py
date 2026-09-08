@@ -162,4 +162,4 @@ def test_cleanup_warning_is_not_transfer_failure(dashboard_window,monkeypatch):
     assert 'Migration complete' in w.status.text()
     assert 'local cleanup warnings' in w.completion_title.text()
     assert not w.cleanup_notice.isHidden() and w.attention_title.isHidden()
-    assert '5 / 6 local copies released' in w.completion_detail.text()
+    assert '5 / 6 local cache files freed' in w.completion_detail.text()

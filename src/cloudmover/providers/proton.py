@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
 from ..diagnostics import safe_diagnostic
+from ..cli_discovery import find_proton_drive_cli
 import hashlib, json, shutil, subprocess, os, signal, tempfile, uuid, logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,9 +39,9 @@ class TreeVerificationUnavailable(RuntimeError):
     """Tree listings are unavailable or incomplete; exact-parent verification may retry."""
 
 def cli() -> str:
-    exe = shutil.which("proton-drive")
+    exe = find_proton_drive_cli()
     if not exe:
-        raise RuntimeError("proton-drive CLI not found in PATH")
+        raise RuntimeError("proton-drive CLI not found in PATH or standard macOS locations")
     return exe
 
 

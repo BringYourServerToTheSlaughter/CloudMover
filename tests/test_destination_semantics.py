@@ -114,7 +114,7 @@ def test_wizard_collision_prevents_inventory(tmp_path,monkeypatch):
         app.processEvents();time.sleep(.005)
     assert w.scan_summary is None and not w.scan_running()
     assert not (tmp_path/'db').exists()
-    w.go_back();assert w.pages.currentIndex()==1
+    assert w.pages.currentIndex()==1
     w.dest_edit.setText('/my-files/My iCloud Backup')
     assert w.destination=='/my-files/My iCloud Backup'
     assert w.dest_name.text()=='Proton Drive → My iCloud Backup'
