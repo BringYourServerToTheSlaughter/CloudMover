@@ -8,6 +8,20 @@ CloudMover is actively being developed. Version 0.20.0 is a product and usabilit
 
 This repository contains the app source code, not a prebuilt `CloudMover.app`. Build the macOS app locally on your Mac using the instructions below; the generated bundle is written to `dist/CloudMover.app` and is not included in Git.
 
+## License and project independence
+
+CloudMover's source code is publicly viewable, but **CloudMover is not currently released as open-source software**.
+
+Copyright © 2026 Gabe Moncada. All rights reserved.
+
+Viewing or forking this repository on GitHub does not grant permission to redistribute, repackage, modify, sell, commercially exploit, or incorporate CloudMover into another product or service except as permitted by applicable law or GitHub's Terms of Service. See the [`LICENSE`](LICENSE) file for the complete terms.
+
+CloudMover is an **independent community project**. It is not an official Proton product and is not affiliated with, sponsored by, or endorsed by Proton AG unless explicitly stated otherwise by Proton.
+
+References to Proton, Proton Drive, and related products are used solely to describe compatibility and functionality. Their names, logos, and trademarks remain the property of their respective owners.
+
+For permission to reuse or redistribute CloudMover beyond the terms above, contact the repository owner.
+
 ## Features
 
 - **Graphical macOS interface:** Setup → Select → Review → Move → Complete, with a searchable file/folder selection tree.
@@ -68,7 +82,7 @@ These screenshots show the macOS app's setup, selection, review, migration, and 
 - Packaged Proton CLI discovery for Finder launches, including `/usr/local/bin/proton-drive` and `/opt/homebrew/bin/proton-drive` alongside normal PATH lookup.
 - **310 automated tests passed at release validation**, followed by manual approval of the packaged app.
 
-Release commit: [`12cc037`](https://github.com/PepeLePewCO/CloudMover/commit/12cc0374e97ef5d45dc72def550479ab0d462a29) — `Release CloudMover 0.20.0`.
+Release commit: [`12cc037`](https://github.com/BringYourServerToTheSlaughter/CloudMover/commit/12cc0374e97ef5d45dc72def550479ab0d462a29) — `Release CloudMover 0.20.0`.
 
 ## Getting started
 
