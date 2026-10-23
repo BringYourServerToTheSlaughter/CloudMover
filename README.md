@@ -6,6 +6,8 @@ CloudMover is a macOS migration utility for safely moving files from **iCloud Dr
 
 CloudMover is actively being developed. Version 0.20.0 is a product and usability milestone, not a production-final 1.0 release. The currently supported migration path is iCloud Drive → Proton Drive on macOS.
 
+This repository contains the app source code, not a prebuilt `CloudMover.app`. Build the macOS app locally on your Mac using the instructions below; the generated bundle is written to `dist/CloudMover.app` and is not included in Git.
+
 ## Features
 
 - **Graphical macOS interface:** Setup → Select → Review → Move → Complete, with a searchable file/folder selection tree.
@@ -16,6 +18,43 @@ CloudMover is actively being developed. Version 0.20.0 is a product and usabilit
 - **Clear progress:** separate overall verification counts, current-file/batch activity, and actionable errors; no invented upload percentages.
 - **Support diagnostics:** Export Log… saves a copy of the existing JSONL log without changing the original.
 - **Verified-before-release safety:** temporary local iCloud storage is freed only after the Proton copy is verified. Local cleanup warnings remain separate from transfer failures.
+
+## App screenshots
+
+These screenshots show the macOS app's setup, selection, review, migration, and completion screens. Expand the section to view the full walkthrough.
+
+<details>
+<summary>View the CloudMover app walkthrough</summary>
+
+### 1. Safety setup
+
+![CloudMover safety acknowledgment screen](docs/screenshots/01-setup-safety.png)
+
+### 2. Choose the source and destination
+
+![CloudMover source and destination setup screen](docs/screenshots/02-setup-source-destination.png)
+
+### 3. Review the scan
+
+![CloudMover completed scan screen](docs/screenshots/03-scan-complete.png)
+
+### 4. Select files and folders
+
+![CloudMover file selection screen](docs/screenshots/04-select-files.png)
+
+### 5. Review the migration
+
+![CloudMover migration review screen](docs/screenshots/05-review-migration.png)
+
+### 6. Follow migration progress
+
+![CloudMover migration progress screen](docs/screenshots/06-migration-progress.png)
+
+### 7. Confirm completion
+
+![CloudMover successful migration completion screen](docs/screenshots/07-migration-complete.png)
+
+</details>
 
 ## What's new in 0.20.0
 
@@ -133,7 +172,7 @@ Authentication/network errors do not authorize folder creation. Final collision 
 
 ### Development and local builds
 
-The source project requires Python 3.11+; the GUI uses PySide6. The macOS build requires PyInstaller and the project's test dependencies in the active Python environment.
+The source project requires macOS 13 or later and Python 3.11+. The GUI uses PySide6. To create the app bundle, install PyInstaller and pytest in the same Python environment. The repository does not include a prebuilt app, and the bundle is created on your Mac.
 
 ```bash
 # Open the GUI from the repository
@@ -148,15 +187,20 @@ python3 -m src.cloudmover.state status --db "$HOME/Library/Application Support/C
 
 The component CLI entry points remain useful for controlled development. Use their `--help` output for current options; prefer the GUI setup flow for a normal migration. Historical trial commands and test destinations are not the current product workflow.
 
-To build locally on macOS:
+To create and run the macOS app from a fresh checkout, open Terminal in the repository and run:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[gui]' pytest pyinstaller
 ./scripts/build_macos_app.sh
-# Alternatively: make app
 open dist/CloudMover.app
 ```
 
-The build script runs the automated suite before packaging. Local builds use an ad-hoc signature; they are not Developer ID signed or notarized distribution builds. The packaged worker runs inside the bundled executable and does not need an external Python interpreter. Runtime locations can be changed with `CLOUDMOVER_APP_SUPPORT`; development entry points also support explicit database/log options where applicable.
+The build script runs the automated test suite before packaging and creates `dist/CloudMover.app` locally. You can also run `make app` to build and `make open-app` to launch the bundle after it has been built.
+
+Local builds use an ad-hoc signature; they are not Developer ID signed or notarized distribution builds. The packaged worker runs inside the bundled executable and does not need an external Python interpreter. Runtime locations can be changed with `CLOUDMOVER_APP_SUPPORT`; development entry points also support explicit database/log options where applicable.
 
 ### Project layout and further reading
 
